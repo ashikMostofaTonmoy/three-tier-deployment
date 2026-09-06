@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build output
+frontend/dist/
+dist/
+*.tgz
+
+# local env files (keep .env.example, ignore real ones)
+.env
+.env.local
+frontend/.env
+frontend/.env.local
+
+# lab state written by the infra scripts
+.lab-state
+infra/.lab-state
+
+# editor / OS
+.DS_Store
+.vscode/
+
+# never commit infra state / private key
+infra/.lab-state
+infra/*.pem

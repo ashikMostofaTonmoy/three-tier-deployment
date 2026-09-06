@@ -1,0 +1,116 @@
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-2: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --error: #fca5a5;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: linear-gradient(160deg, #0f172a, #1e293b);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.page {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 3rem 1.25rem 2rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 2rem;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  margin: 0.25rem 0 1.5rem;
+  color: var(--muted);
+}
+
+.city-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.chip {
+  border: 1px solid var(--panel-2);
+  background: var(--panel);
+  color: var(--text);
+  padding: 0.45rem 0.9rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.chip:hover { border-color: var(--accent); }
+
+.chip-active {
+  background: var(--accent);
+  color: #0b1220;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 16px;
+  padding: 1.5rem;
+  min-height: 200px;
+}
+
+.state { color: var(--muted); }
+.state-error { color: var(--error); }
+
+.weather-now {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.weather-icon { font-size: 3.5rem; line-height: 1; }
+.weather-temp { font-size: 2.5rem; font-weight: 700; }
+.weather-desc { color: var(--text); margin-top: 0.15rem; }
+.weather-meta { color: var(--muted); font-size: 0.85rem; margin-top: 0.35rem; }
+
+.forecast {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.forecast-day {
+  flex: 1;
+  background: var(--panel-2);
+  border-radius: 12px;
+  padding: 0.75rem;
+  text-align: center;
+}
+
+.forecast-dow { font-size: 0.8rem; color: var(--muted); }
+.forecast-icon { font-size: 1.75rem; margin: 0.25rem 0; }
+.forecast-range { font-size: 0.85rem; }
+
+.build-info {
+  margin-top: 2rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.build-info code {
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  padding: 0.15rem 0.4rem;
+  border-radius: 6px;
+}
