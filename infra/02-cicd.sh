@@ -111,6 +111,9 @@ aws iam put-role-policy --role-name "$CICD_ROLE_NAME" --policy-name deploy \
       ] },
     { "Sid": "WatchTheCommand", "Effect": "Allow",
       "Action": ["ssm:GetCommandInvocation","ssm:ListCommandInvocations"],
+      "Resource": "*" },
+    { "Sid": "FindThePublicIp", "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
       "Resource": "*" }
   ]
 }
