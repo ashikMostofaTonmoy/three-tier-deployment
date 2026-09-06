@@ -42,9 +42,11 @@ else
 fi
 
 # ---- 2. GitHub OIDC provider (reuse if the account already has one) -----
-CREATED_OIDC=false
+# "Did THIS lab create it?" must be sticky: once true, stay true across re-runs,
+# so teardown only ever deletes a provider we made.
+CREATED_OIDC="$(state_get CREATED_OIDC)"; [ "$CREATED_OIDC" = "true" ] || CREATED_OIDC=false
 if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_ARN" >/dev/null 2>&1; then
-  echo "OIDC provider    : $OIDC_HOST (already exists — reusing)"
+  echo "OIDC provider    : $OIDC_HOST (already exists — reusing, CREATED_OIDC=$CREATED_OIDC)"
 else
   aws iam create-open-id-connect-provider \
     --url "https://${OIDC_HOST}" \
