@@ -55,6 +55,12 @@ else
 fi
 
 # ---- 3. IAM role that GitHub Actions assumes --------------------------
+# The real guard is the clean "repository" claim. AWS also insists the trust
+# policy constrain "sub", so we allow both sub shapes: the plain one, and the
+# one some accounts emit with immutable numeric IDs
+# (repo:owner@123/name@456:...).
+GH_OWNER="${GH_REPO%%/*}"
+GH_NAME="${GH_REPO##*/}"
 TRUST="$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -63,8 +69,16 @@ TRUST="$(cat <<JSON
     "Principal": { "Federated": "${OIDC_ARN}" },
     "Action": "sts:AssumeRoleWithWebIdentity",
     "Condition": {
-      "StringEquals": { "${OIDC_HOST}:aud": "sts.amazonaws.com" },
-      "StringLike":   { "${OIDC_HOST}:sub": "repo:${GH_REPO}:*" }
+      "StringEquals": {
+        "${OIDC_HOST}:aud": "sts.amazonaws.com",
+        "${OIDC_HOST}:repository": "${GH_REPO}"
+      },
+      "StringLike": {
+        "${OIDC_HOST}:sub": [
+          "repo:${GH_REPO}:*",
+          "repo:${GH_OWNER}@*/${GH_NAME}@*:*"
+        ]
+      }
     }
   }]
 }

@@ -41,13 +41,6 @@ jobs:
           npm run build
           tar -C dist -czf ../dist.tgz .
 
-      - name: Show OIDC token claims (debug)
-        run: |
-          PAYLOAD=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value' | cut -d. -f2)
-          # pad and decode
-          python3 -c "import base64,sys,json; s=sys.argv[1]; s+='='*(-len(s)%4); print(json.dumps({k:json.loads(base64.urlsafe_b64decode(s))[k] for k in ('sub','aud','repository','repository_owner','ref')}, indent=2))" "$PAYLOAD"
-
       - name: Get temporary AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
