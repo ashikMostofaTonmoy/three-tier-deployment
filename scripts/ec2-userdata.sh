@@ -17,9 +17,14 @@
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# ---- 1. Nginx --------------------------------------------------------------
+# ---- 1. Nginx + AWS CLI --------------------------------------------------
+# (Ubuntu 24.04 dropped the "awscli" apt package, so install v2 from AWS.)
 apt-get update -y
-apt-get install -y nginx
+apt-get install -y nginx curl unzip
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+rm -rf /tmp/aws /tmp/awscliv2.zip
 
 # ---- 2. Folder layout: releases + a "current" symlink --------------------
 install -d /var/www/three-tier/releases/000-placeholder
