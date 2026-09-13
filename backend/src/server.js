@@ -3,6 +3,7 @@
 // This is the ONLY thing in the whole stack that talks to Open-Meteo AND the
 // ONLY thing that talks to Postgres. The frontend never does either directly —
 // it only ever calls this service (through Nginx's /api/ proxy).
+import 'dotenv/config'; // loads .env into process.env — PM2 does not do this itself
 import express from 'express';
 import { pool } from './db.js';
 
