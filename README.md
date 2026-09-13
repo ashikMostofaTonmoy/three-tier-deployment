@@ -40,6 +40,27 @@ The repo is laid out as a "three-tier" project from the start — `frontend/` (P
 20. [Full picture — everything, both paths](#20-full-picture--everything-both-paths)
 21. [Cleanup (Part 2)](#21-cleanup-part-2)
 
+**Part 3 — Monitoring Fundamentals & Prometheus**
+22. [Why Monitoring Matters](#22-why-monitoring-matters)
+23. [Introduction to Prometheus](#23-introduction-to-prometheus)
+24. [Setting Up Prometheus](#24-setting-up-prometheus)
+25. [Hands-on: Install Prometheus on EC2](#25-hands-on-install-prometheus-on-ec2)
+26. [Node Exporter Deep Dive](#26-node-exporter-deep-dive)
+27. [Configure Prometheus to Scrape Node Exporter](#27-configure-prometheus-to-scrape-node-exporter)
+28. [PromQL](#28-promql)
+
+**Part 4 — Visualization, Alerting & Production Monitoring**
+29. [Introduction to Grafana](#29-introduction-to-grafana)
+30. [Setting Up Grafana](#30-setting-up-grafana)
+31. [Hands-on: Deploy Grafana on EC2](#31-hands-on-deploy-grafana-on-ec2)
+32. [Add Prometheus Data Source](#32-add-prometheus-data-source)
+33. [Creating Your First Dashboard](#33-creating-your-first-dashboard)
+34. [Use Community Dashboards](#34-use-community-dashboards)
+35. [Create the Three-Tier Application Dashboard](#35-create-the-three-tier-application-dashboard)
+36. [Monitoring Application Metrics — Backend, Frontend, Database](#36-monitoring-application-metrics--backend-frontend-database)
+37. [Setting Up Alerts for Application Health](#37-setting-up-alerts-for-application-health)
+38. [Full picture (Parts 1–4) + Cleanup](#38-full-picture-parts-14--cleanup)
+
 ---
 
 ## ⚠️ Read this first — money and safety
@@ -1496,12 +1517,649 @@ gh api repos/<user>/three-tier-deployment/actions/runners --jq '.runners'       
 
 ---
 
+## 22. Why Monitoring Matters
+
+**What you'll learn:** the case for monitoring, before any tool.
+
+Picture this: your app goes down at 2am. Nobody is watching a terminal. The first
+person to notice is a user, hours later, who can't check the weather and quietly
+gives up. By the time someone investigates, the trail is cold — was it the
+database? The backend? Did the disk fill up? Without monitoring, every incident
+starts with "I have no idea."
+
+Monitoring answers three questions, continuously, without a human watching:
+1. **Is it up?** (the host, each tier, the app as a whole)
+2. **Is it healthy?** (not just "responding," but responding *fast enough*,
+   *without errors*, *with resources to spare*)
+3. **What just changed?** (so when #1 or #2 goes bad, you have a timeline)
+
+This class covers two complementary tools: **Prometheus** collects and stores
+numbers over time (*metrics*) and can tell someone when a number crosses a
+line (*alerting*, §37); **Grafana** (Part 4) turns those numbers into pictures
+a human can actually read at a glance. A third signal — **logs**, the detailed
+"what happened" a metric can't capture — joins the stack in §36.
+
+Four tiers, four different things worth watching:
+
+| Tier | "Is it healthy?" looks like |
+|---|---|
+| Host (the VM itself) | CPU, memory, disk not maxed out |
+| Frontend (Nginx) | serving requests, not erroring |
+| Backend (the API) | fast, low error rate, actually reachable |
+| Database (Postgres) | accepting connections, not overloaded |
+
+---
+
+## 23. Introduction to Prometheus
+
+**What you'll learn:** the pull model, what a "target" and a "time series"
+are — the two ideas everything else in this class builds on.
+
+Prometheus is a **pull-based** monitoring system: instead of your app pushing
+data somewhere, Prometheus reaches *out* to a list of addresses on a timer and
+asks each one "what are your numbers right now?" Each address is a **target**;
+what it exposes is a plain HTTP page of numbers called `/metrics`. A program
+that turns "some system's internal state" into that plain-text page is called
+an **exporter** — Node Exporter (§26) turns Linux's own `/proc` filesystem
+into a `/metrics` page, for instance.
+
+```mermaid
+sequenceDiagram
+    participant P as Prometheus
+    participant T as A target (e.g. Node Exporter)
+    loop every scrape_interval (e.g. 15s)
+        P->>T: GET /metrics
+        T-->>P: plain text: metric_name{labels} value
+        P->>P: store each line as one more point in its time series
+    end
+```
+
+Why pull instead of push? Prometheus alone decides *when* to ask (so one slow
+target can't flood it), targets don't need to know anything about where data
+goes (a target that comes up serves the same `/metrics` whether anyone's
+scraping it or not), and — the part that matters most for this class — **if
+Prometheus can't reach a target, that absence is itself the signal** ("this
+thing stopped answering" is exactly what the `up` metric and the
+`InstanceDown` alert in §37 are built on).
+
+Every number Prometheus stores is a **time series**: a metric name, a set of
+key/value **labels** that distinguish one instance of it from another (e.g.
+`http_requests_total{method="GET",route="/health"}` is a different series
+from the same metric with `route="/api/v1/history"`), and a value at a point
+in time. Prometheus's own database (a **TSDB**, time-series database) is built
+to store an enormous number of these efficiently and query across time.
+
+---
+
+## 24. Setting Up Prometheus
+
+**What you'll learn:** the anatomy of `prometheus.yml` — read it before you
+run it.
+
+Open [`monitoring/prometheus.yml`](monitoring/prometheus.yml). Four sections:
+
+```yaml
+global:
+  scrape_interval: 15s      # how often, by default, to poll every target
+  evaluation_interval: 15s  # how often to re-check the alert rules
+
+rule_files:
+  - "alert-rules.yml"       # where the alert conditions live (§37)
+
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ["localhost:9093"] }]   # where to send a firing alert
+
+scrape_configs:              # the actual list of targets — one job per "kind" of thing
+  - job_name: "node"
+    static_configs: [{ targets: ["localhost:9100"] }]
+  # ...
+```
+
+A `job_name` groups related targets under one label (`job="node"`,
+`job="backend"`, etc.) — every PromQL query in §28 filters or groups by `job`.
+
+---
+
+## 25. Hands-on: Install Prometheus on EC2
+
+**What you'll learn:** getting Prometheus running for real, and why its port
+is restricted to your IP.
+
+**You need:** the instance from Part 2 (or a fresh one — §15), bumped to
+`t3.medium` this time — Postgres + a 2-worker Node cluster + Prometheus +
+Grafana + three exporters is real memory pressure that `t3.small`'s 2GB
+doesn't comfortably have.
+
+```bash
+./infra/01-ec2.sh --instance-type t3.medium
+./infra/30-monitoring-sg.sh
+```
+
+`30-monitoring-sg.sh` opens three ports on the **same** security group Part 1
+already created — no new SG, nothing new to clean up separately:
+
+```console
+$ ./infra/30-monitoring-sg.sh
+  + port 9090 from <your-ip>/32 (prometheus-ui-my-ip)
+  + port 9093 from <your-ip>/32 (alertmanager-ui-my-ip)
+  + port 3001 from 0.0.0.0/0 (grafana-public)
+```
+
+**Why Prometheus and Alertmanager stay IP-restricted but Grafana doesn't:**
+Prometheus and Alertmanager ship with **no authentication at all** — anyone
+who can reach port 9090 can read every metric this app has ever produced, and
+anyone reaching 9093 can silence your alerts. Grafana has a real login
+(forced password change on first use, §30), so opening it to the world is a
+normal — if still slightly bold for a permanent server — choice; doing the
+same for Prometheus would not be.
+
+Then install:
+
+```bash
+scripts/deploy-monitoring.sh
+```
+
+This installs seven services; §25/§31 only cover the two this chapter cares
+about. Once it finishes, open `http://<PUBLIC_IP>:9090` in a browser — the
+Prometheus UI. Click **Status → Targets**. The `prometheus` job (Prometheus
+scraping itself) should show **UP** — the simplest possible thing to check
+first, and proof the service is alive before you add anything else.
+
+**If it breaks:** browser times out → re-check `./infra/30-monitoring-sg.sh`
+ran and your IP hasn't changed since (same caveat as SSH in Part 1 §5).
+
+---
+
+## 26. Node Exporter Deep Dive
+
+**What you'll learn:** what Node Exporter actually collects, before treating
+it as a black box.
+
+Node Exporter reads Linux's own bookkeeping — `/proc`, `/sys` — and republishes
+it as Prometheus metrics. A few families that matter most:
+
+| Metric | What it is |
+|---|---|
+| `node_cpu_seconds_total{mode="idle"\|"user"\|"system"...}` | cumulative CPU time by mode — a **counter**, always increasing |
+| `node_memory_MemTotal_bytes` / `node_memory_MemAvailable_bytes` | total vs. actually-available RAM |
+| `node_filesystem_size_bytes` / `node_filesystem_avail_bytes` | per-mountpoint disk size vs. free |
+| `node_load1` / `node_load5` / `node_load15` | classic Unix load averages |
+
+Notice `node_cpu_seconds_total` is a **counter** (only goes up — total seconds
+spent, ever) not a percentage. There is no `node_cpu_percent` metric to graph
+directly; §28 shows why, and how `rate()` turns a counter into the percentage
+you actually want.
+
+`scripts/deploy-monitoring.sh` installed it as a systemd service bound to
+`127.0.0.1:9100` — never touches the security group (§12's pattern). Look at
+the raw page it exposes:
+
+```console
+$ curl -s http://localhost:9100/metrics | grep node_load1
+node_load1 0.08
+```
+
+---
+
+## 27. Configure Prometheus to Scrape Node Exporter
+
+**What you'll learn:** the one line that turns "a program exposing metrics"
+into "something Prometheus actually watches" — and how to prove it worked.
+
+Node Exporter running is not enough on its own; Prometheus has to be *told*
+about it. That's the `job_name: "node"` entry already in
+[`monitoring/prometheus.yml`](monitoring/prometheus.yml):
+
+```yaml
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+```
+
+After editing a config, Prometheus needs to reload it — either a full
+restart, or (since it was started with `--web.enable-lifecycle`) a live
+reload with no downtime:
+
+```bash
+curl -X POST http://localhost:9090/-/reload
+```
+
+Verify on the **Status → Targets** page: the `node` job should show **UP**,
+with a "Last Scrape" time that keeps moving forward every 15s. This is the
+whole loop from §23 made concrete: Prometheus asked, Node Exporter answered,
+and now there's a growing time series for every metric in §26.
+
+---
+
+## 28. PromQL
+
+**What you'll learn:** enough PromQL to ask real questions of real data —
+`rate()`, aggregation, and `histogram_quantile()`.
+
+Prometheus's UI has a **Graph** tab — open it, and try each query below
+against your own running Node Exporter.
+
+**A raw counter is almost never what you want to graph.** `node_cpu_seconds_total`
+only ever goes up; graphed directly it's just a line climbing forever. What
+you actually want is *how fast* it's climbing — that's `rate()`:
+
+```promql
+rate(node_cpu_seconds_total{mode="idle"}[5m])
+```
+
+This means "the per-second average rate of increase, over the last 5
+minutes" — for CPU idle time, that's the fraction of a second per second the
+CPU spent idle, i.e. how NOT-busy it's been. Flip it into "how busy":
+
+```promql
+100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+`avg(...)` here is an **aggregation** — it collapses multiple time series
+(one per CPU core) into one number. Aggregations can group by a label instead
+of collapsing everything, with `by (...)`:
+
+```promql
+sum by (route) (rate(http_requests_total{job="backend"}[5m]))
+```
+
+"Request rate, broken down per API route" — one line per distinct `route`
+label value, instead of one grand total.
+
+Finally, **percentiles from a histogram**. `http_request_duration_seconds`
+(§13) is a Histogram, not a single number — it counts how many requests fell
+into each duration "bucket." `histogram_quantile()` turns those buckets into
+an estimated percentile:
+
+```promql
+histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{job="backend"}[5m])))
+```
+
+"The 95th-percentile latency, per route" — the number below which 95% of
+requests finished. This is the query behind the p95 panel in §35.
+
+Three queries to actually run against your own instance right now:
+
+```promql
+100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)                                      -- CPU busy %
+(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100                              -- memory used %
+(1 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})) * 100 -- disk used %
+```
+
+---
+
+## 29. Introduction to Grafana
+
+**What you'll learn:** what Grafana adds on top of what you already have.
+
+Prometheus's own UI (the Graph tab you just used) is genuinely useful for
+one-off questions, but it isn't built to be *lived in*: no saved layouts, no
+mixing data from more than one source on one screen, no alerting UI beyond
+the raw rule list, nothing built for a wall-mounted "here's the state of
+everything" view. Grafana is a separate, general-purpose visualization
+layer that reads from Prometheus (and Loki, and many other systems) instead
+of replacing it — Prometheus decides what's true, Grafana decides how it looks.
+
+---
+
+## 30. Setting Up Grafana
+
+**What you'll learn:** the install, and a genuine gotcha this repo already
+walked into once.
+
+**The port collision:** Grafana's default port is **3000** — which, on this
+exact VM, is already the backend's internal port (§13, `PORT=3000` in its
+`.env`). Running both on 3000 would mean whichever started last wins and the
+other silently fails to bind. `scripts/deploy-monitoring.sh` sets
+`http_port = 3001` in `/etc/grafana/grafana.ini` before starting it. Two
+services on one box quietly wanting the same port is a completely normal
+real-world surprise — better to hit it once here than in front of a class.
+
+First login is `admin` / `admin` — Grafana forces a password change
+immediately. Since §17's security group answer opened Grafana to the whole
+internet, **do this before anyone else finds the login page.**
+
+---
+
+## 31. Hands-on: Deploy Grafana on EC2
+
+**What you'll learn:** confirming it's actually reachable, from outside.
+
+Grafana was already installed by the same `scripts/deploy-monitoring.sh` run
+in §25 (one script, seven services — see §25's note). Confirm it's live:
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" http://<PUBLIC_IP>:3001/login
+200
+```
+
+Open `http://<PUBLIC_IP>:3001/` in a browser and log in.
+
+---
+
+## 32. Add Prometheus Data Source
+
+**What you'll learn:** wiring Grafana to Prometheus, by hand once, then seeing
+the "automate it" version.
+
+In Grafana: **Connections → Data sources → Add data source → Prometheus**.
+URL: `http://localhost:9090` (Grafana and Prometheus are on the same box —
+this is the same "reach it over localhost" pattern as everything in §12).
+**Save & test** should report success.
+
+That manual click-through is exactly what
+[`monitoring/datasource-prometheus.yml`](monitoring/datasource-prometheus.yml)
+describes as a file:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+```
+
+Drop a file like this in `/etc/grafana/provisioning/datasources/` and Grafana
+wires up the same data source on every restart, with nobody clicking
+anything — the general pattern behind "infrastructure as code," applied to a
+Grafana setting instead of an AWS resource.
+
+---
+
+## 33. Creating Your First Dashboard
+
+**What you'll learn:** one panel, built by hand, so the pieces are familiar
+before §34/§35 hand you finished ones.
+
+**Dashboards → New → New Dashboard → Add visualization → your Prometheus data
+source.** Paste one query from §28:
+
+```promql
+100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+Set the unit (panel options → Standard options → Unit → **Percent (0-100)**)
+and give it a title. **Save dashboard.** That's the entire loop: a PromQL
+query in, a labelled, auto-refreshing chart out.
+
+---
+
+## 34. Use Community Dashboards
+
+**What you'll learn:** you rarely start from a blank panel in real work — the
+Grafana community has already built most of what you need.
+
+**Dashboards → New → Import**, enter ID **`1860`** ("Node Exporter Full," one
+of the most widely used community dashboards), pick your Prometheus data
+source, **Import**. Every panel lights up immediately with your own host's
+real data — dozens of CPU/memory/disk/network panels nobody on this project
+had to build.
+
+---
+
+## 35. Create the Three-Tier Application Dashboard
+
+**What you'll learn:** building a dashboard that mixes generic host metrics
+with metrics that only make sense for *this* app — the theme §36 names
+directly.
+
+Import [`monitoring/dashboards/three-tier-app-dashboard.json`](monitoring/dashboards/three-tier-app-dashboard.json)
+the same way as §34 (**Dashboards → New → Import**, this time upload the
+file). It's laid out in two rows on purpose:
+
+- **Server** — host CPU/mem/disk (§26/§28's queries), Nginx requests/sec,
+  Postgres active connections. Would look almost identical no matter what
+  app ran on this box.
+- **Application** — backend request rate and p95 latency by route (§28's
+  `histogram_quantile` query), the 5xx error rate, and two panels that only
+  exist because of *this specific app*: weather searches by city, and the
+  last known temperature per city.
+
+---
+
+## 36. Monitoring Application Metrics — Backend, Frontend, Database
+
+**What you'll learn:** the difference between watching a server and watching
+an application, made concrete — plus logs as the signal metrics can't give you.
+
+**Server monitoring vs application monitoring.** Node Exporter would report
+the exact same CPU/memory numbers whether this VM ran a weather app or a
+photo gallery — it knows nothing about what's running, only about the
+machine. `postgres_exporter`'s `pg_up`/`pg_stat_activity_count` are similar:
+useful, but generic to "a Postgres server," not to *this* database's job. The
+backend's own metrics (`backend/src/metrics.js`) are different in kind:
+`weather_search_requests_total{city}` and `weather_current_temperature_celsius{city}`
+literally cannot exist without knowing what this app does. Both kinds matter
+— a healthy host running a broken app still looks "green" on server metrics
+alone — which is exactly why §35's dashboard keeps them as two visibly
+separate rows instead of one undifferentiated wall of graphs.
+
+**A real gotcha, found live building this repo:** the backend runs as 2 PM2
+cluster workers (§13/§15 — needed for zero-downtime deploys). Each worker
+holds its *own* copy of every counter in its own process memory. Naively
+scraping `/metrics` on the shared port 3000 would silently see only whichever
+worker happened to answer that particular connection — a `Counter` that's
+supposed to only go up could appear to jump backward every time Prometheus
+happened to hit the *other* worker. The fix, in `backend/src/metrics.js`:
+each worker binds its metrics on its **own** port
+(`9200 + NODE_APP_INSTANCE`, and PM2 sets `NODE_APP_INSTANCE` to `0`/`1`
+automatically), so [`monitoring/prometheus.yml`](monitoring/prometheus.yml)
+scrapes `localhost:9200` **and** `localhost:9201` as two separate targets,
+and every dashboard query combines them with `sum by (...)` (§28) —
+Prometheus does the adding up, not the app.
+
+**Logs — the third pillar.** A metric tells you *something* is wrong (error
+rate spiked); it can't tell you *what* the error actually was. That's what
+logs are for. The backend switched from `console.log`/`console.error` to
+structured JSON logging (`backend/src/logger.js`, using `pino`) — every log
+line is one JSON object (`{"level":30,"msg":"forecast lookup",...}`) instead
+of free text, so it can be parsed and filtered reliably. PM2 already captures
+that stdout into `~/.pm2/logs/backend-out-*.log` with zero extra
+configuration; **Promtail** (an agent that tails log files the same way
+`tail -f` does, then forwards new lines onward) ships that file — and
+Nginx's own access/error logs — to **Loki**, a log-storage system built to
+feel like "Prometheus, but for logs." Add it as a second Grafana data source
+(**Connections → Data sources → Add → Loki**, URL `http://localhost:3100`,
+or use the committed
+[`monitoring/datasource-loki.yml`](monitoring/datasource-loki.yml) the same
+way as §32), then open **Explore**, pick Loki, and query:
+
+```logql
+{job="backend"}
+```
+
+Every structured log line the backend has written, live, filterable by the
+`level` label Promtail extracted from the JSON. This is the same log source
+feeding the "Recent backend logs" panel on §35's dashboard.
+
+---
+
+## 37. Setting Up Alerts for Application Health
+
+**What you'll learn:** turning a PromQL expression into something that pages
+a human — Prometheus decides *what*, Alertmanager decides *who* and *how
+often*.
+
+Open [`monitoring/alert-rules.yml`](monitoring/alert-rules.yml):
+
+```yaml
+- alert: BackendDown
+  expr: up{job="backend"} == 0
+  for: 30s
+  labels: { severity: critical }
+  annotations:
+    summary: "Backend API is down"
+```
+
+`expr` is any PromQL query that returns something — if it returns *any*
+result, the alert is a candidate to fire. `for: 30s` is doing real work here:
+without it, one bad scrape (a GC pause, a network blip) would fire an alert
+for nothing. "True continuously for 30 seconds" filters that noise out. When
+the condition holds that long, the alert moves **Inactive → Pending →
+Firing** — watch this transition happen live in Prometheus's own **Alerts**
+page during the demo below.
+
+**Why both Grafana alerting *and* Alertmanager, when either alone would
+work:** Grafana can evaluate its own alert rules directly against a
+dashboard panel — simpler, one less service. Alertmanager is what a real
+Prometheus-centric shop uses instead: Prometheus itself evaluates the rule
+(so alerting keeps working even if Grafana is down), and Alertmanager's job
+is purely **routing** — grouping related alerts together, not re-notifying
+about the same open incident every 15 seconds, and deciding *where* an alert
+goes (Slack, here). Seeing the real Alertmanager, not just Grafana's
+built-in version, is worth the one extra service for a class about
+production monitoring specifically.
+
+**Wire up Slack** (`monitoring/alertmanager.yml.example` → real config on the
+server): in Slack, go to a workspace's **Apps → Incoming Webhooks** (or
+`api.slack.com/apps` → *Create New App* → *From scratch* → **Incoming
+Webhooks** → *Activate* → *Add New Webhook to Workspace*, pick a channel).
+Copy the resulting URL (`https://hooks.slack.com/services/...`) and re-run:
+
+```bash
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..." scripts/deploy-monitoring.sh
+```
+
+Without a URL, the stack still runs correctly — alerts fire and are visible
+in both UIs, they just don't reach Slack (the config ships with a harmless
+placeholder value). **The placeholder has to be a real-looking URL, though**
+(`https://hooks.slack.com/services/PLACEHOLDER/...`), not just a bare token —
+found live building this: Alertmanager validates the webhook URL's syntax
+the moment it **starts up**, not only when it tries to send. A schemeless
+placeholder made the whole service crash-loop before it ever got the chance
+to receive an alert.
+
+**Live demo — watch an alert happen:**
+
+```bash
+ssh -i infra/three-tier-key.pem ubuntu@<PUBLIC_IP> 'pm2 stop backend'
+```
+
+Within 30 seconds, Prometheus's **Alerts** page shows `BackendDown` go
+`Pending` → `Firing`; check Alertmanager at `http://<PUBLIC_IP>:9093` and the
+same alert appears there, grouped and ready to route. Pull up Loki (§36) for
+the same time window — you'll likely see nothing new from the backend at
+all, which is itself informative (it's not erroring, it's *gone*). Resolve
+it:
+
+```bash
+ssh -i infra/three-tier-key.pem ubuntu@<PUBLIC_IP> 'pm2 start backend || pm2 startOrReload /opt/three-tier-backend/ecosystem.config.cjs'
+```
+
+Both UIs clear within one more evaluation cycle. Verified live, running this
+exact sequence:
+
+```console
+$ pm2 stop backend
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost/api/v1/history
+502
+   ... 30s later, Prometheus Alerts page: BackendDown Pending -> Firing ...
+$ curl -s http://localhost:9093/api/v2/alerts | jq -r '.[].labels.alertname'
+InstanceDown
+BackendDown
+BackendDown
+InstanceDown
+$ pm2 start backend
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost/api/v1/history
+200
+   ... one evaluation cycle later ...
+$ curl -s http://localhost:9090/api/v1/alerts | jq '.data.alerts | length'
+0
+```
+
+(`InstanceDown` fired too — it's the generic `up == 0` rule, and it matches
+the same two targets `BackendDown` does. Two alerts firing for one real
+outage, from two different rules, is normal — Alertmanager's `group_by` in
+§37's config exists specifically to bundle situations like this together
+instead of paging someone twice.) Pulling the backend's own logs for that
+exact window from Loki shows the restart, corroborating the metrics:
+
+```console
+$ curl -s -G http://localhost:3100/loki/api/v1/query_range --data-urlencode 'query={job="backend"}' ...
+{"level":30,"time":"...","pid":8323,"port":9200,"msg":"metrics server listening"}
+{"level":30,"time":"...","pid":8323,"port":"3000","msg":"backend listening"}
+```
+
+Metrics said *when* it went down and came back; logs said *which processes*
+came up and *when*, corroborating the same timeline from a different angle.
+
+---
+
+## 38. Full picture (Parts 1–4) + Cleanup
+
+**What you'll learn:** everything in this repo, in one diagram, and how
+little is left to clean up.
+
+```mermaid
+flowchart TD
+    subgraph vm["One EC2 instance (t3.medium)"]
+        nginx["Nginx :80"]
+        backend["Backend, PM2 cluster :3000\n+ metrics :9200/:9201"]
+        db[("Postgres :5432")]
+        ne["node_exporter :9100"]
+        nxe["nginx-exporter :9113"]
+        pge["postgres_exporter :9187"]
+        prom["Prometheus :9090"]
+        am["Alertmanager :9093"]
+        loki["Loki :3100"]
+        pt["Promtail"]
+        graf["Grafana :3001"]
+
+        nginx --> backend --> db
+        prom -->|scrapes| ne & nxe & pge & backend
+        prom -->|firing alerts| am
+        pt -->|tails logs from| backend & nginx
+        pt -->|pushes to| loki
+        graf -->|queries| prom & loki
+    end
+
+    visitor["Browser"] -->|":80"| nginx
+    visitor -->|":3001, login required"| graf
+    you["You"] -->|":9090/:9093, your IP only"| prom & am
+    am -->|Slack webhook| slack["Slack"]
+    backend -->|fetch| meteo["Open-Meteo"]
+```
+
+| Component | Job | Inspect it |
+|---|---|---|
+| node_exporter | server metrics | `curl localhost:9100/metrics` |
+| nginx-exporter | Nginx request/status metrics | `curl localhost:9113/metrics` |
+| postgres_exporter | Postgres internals | `curl localhost:9187/metrics` |
+| backend `:9200`/`:9201` | HTTP + business metrics, per worker | `curl localhost:9200/metrics` |
+| Prometheus | scrapes everything, evaluates alert rules | `http://<ip>:9090` |
+| Alertmanager | routes firing alerts to Slack | `http://<ip>:9093` |
+| Loki + Promtail | log storage + shipping | Grafana → Explore → Loki |
+| Grafana | dashboards over Prometheus + Loki | `http://<ip>:3001` |
+
+**Cleanup:** everything in Parts 3–4 lives on the same instance and the same
+security group Parts 1–2 already tear down completely — there is nothing new
+to add. Just run:
+
+```bash
+scripts/cleanup.sh
+```
+
+and re-verify exactly as in §11/§21 (`describe-instances`, `describe-security-groups`,
+`iam get-role`, `aws s3 ls` all coming back empty). If you minted a Slack
+webhook for §37, remove it from the Slack app's settings too — the app is
+gone, but the webhook itself lives in Slack until you delete it there.
+
+---
+
 ## Where this goes next
 
-- **Docker:** package each tier as a container; deploy with `docker compose`
-  instead of PM2 + apt-installed Postgres.
+- **Docker:** package each tier (and the monitoring stack) as containers;
+  deploy with `docker compose` instead of PM2 + apt-installed binaries.
 - **A real domain + HTTPS:** certbot in front of Nginx, same pattern as many
   reference deployments — deliberately left out here to keep the AWS surface
   small for a frontend-focused class.
-- **Split the tiers across instances:** once "why one VM" (§12) makes sense,
-  try three instances + chained security groups as a follow-on exercise.
+- **Split the tiers (and monitoring) across instances:** once "why one VM"
+  (§12) makes sense, try separating them as a follow-on exercise — including
+  putting Prometheus/Grafana on their own box, the more common real-world
+  shape (monitoring shouldn't share fate with what it monitors).
+- **Grafana Alloy:** Promtail (§36) is in maintenance mode; Grafana's
+  actively-developed replacement is worth a look once Promtail's model makes
+  sense.

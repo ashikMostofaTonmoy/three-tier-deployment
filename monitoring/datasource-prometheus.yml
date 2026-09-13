@@ -1,0 +1,13 @@
+# What "Add Prometheus Data Source" (README §32) does by hand, as a file.
+# Drop this in /etc/grafana/provisioning/datasources/ and Grafana wires up
+# the same data source automatically on every restart — no clicking. Shown
+# here as "how you'd automate the manual step you just did", not applied by
+# scripts/deploy-monitoring.sh (the manual click-through is the point of §32).
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    editable: true

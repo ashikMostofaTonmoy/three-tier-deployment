@@ -1,0 +1,8 @@
+# Same idea as datasource-prometheus.yml, for the logs side (README §36).
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://localhost:3100
+    editable: true

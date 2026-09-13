@@ -9,6 +9,8 @@
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.19.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "prom-client": "^15.1.3"
   }
 }

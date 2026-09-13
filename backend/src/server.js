@@ -6,13 +6,26 @@
 import 'dotenv/config'; // loads .env into process.env — PM2 does not do this itself
 import express from 'express';
 import { pool } from './db.js';
+import { logger } from './logger.js';
+import {
+  metricsMiddleware,
+  weatherSearchesTotal,
+  weatherCurrentTemperature,
+  startMetricsServer,
+} from './metrics.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(metricsMiddleware);
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
+
+// --- /metrics lives on its OWN port, not this one — see the comment in
+// metrics.js's cluster-mode section for why. It is NOT behind Nginx's /api/
+// proxy either way, so it is unreachable from the internet regardless.
 
 // GET /api/v1/forecast?latitude=..&longitude=..&city=Dhaka
 //
@@ -42,17 +55,28 @@ app.get('/api/v1/forecast', async (req, res) => {
 
     if (upstream.ok) {
       const temperature = data.current?.temperature_2m ?? null;
+      const cityLabel = city || 'unknown';
+
+      // business metrics — see backend/src/metrics.js for why these are
+      // kept conceptually separate from the generic HTTP metrics above
+      weatherSearchesTotal.inc({ city: cityLabel });
+      if (typeof temperature === 'number') {
+        weatherCurrentTemperature.set({ city: cityLabel }, temperature);
+      }
+
       pool
         .query(
           `INSERT INTO search_history (city, latitude, longitude, temperature)
            VALUES ($1, $2, $3, $4)`,
           [city || null, latitude, longitude, temperature],
         )
-        .catch((err) => console.error('history insert failed (non-fatal):', err.message));
+        .catch((err) => logger.error({ err }, 'history insert failed (non-fatal)'));
     }
 
+    logger.info({ city, latitude, longitude, status: upstream.status }, 'forecast lookup');
     res.status(upstream.status).json(data);
   } catch (err) {
+    logger.error({ err, city, latitude, longitude }, 'forecast lookup failed');
     res.status(502).json({ error: true, reason: err.message });
   }
 });
@@ -69,10 +93,13 @@ app.get('/api/v1/history', async (req, res) => {
     );
     res.json({ rows });
   } catch (err) {
+    logger.error({ err }, 'history query failed');
     res.status(500).json({ error: true, reason: err.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`backend (pid ${process.pid}) listening on port ${PORT}`);
+  logger.info({ pid: process.pid, port: PORT }, 'backend listening');
 });
+
+startMetricsServer();

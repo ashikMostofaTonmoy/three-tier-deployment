@@ -1,0 +1,91 @@
+{
+  "title": "Three-Tier Application Dashboard",
+  "uid": "three-tier-app",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "tags": ["three-tier-lab"],
+  "panels": [
+    { "type": "row", "title": "Server — host, Nginx, Postgres", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 100 },
+
+    {
+      "id": 1, "type": "timeseries", "title": "CPU busy %",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "CPU busy %" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Memory used %",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "Memory used %" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Disk used % (/)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "(1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})) * 100", "legendFormat": "Disk used %" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] }
+    },
+
+    {
+      "id": 4, "type": "timeseries", "title": "Nginx requests/sec",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "rate(nginx_http_requests_total[5m])", "legendFormat": "requests/sec" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Postgres active connections",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "pg_stat_activity_count", "legendFormat": "{{datname}}" }]
+    },
+
+    { "type": "row", "title": "Application — backend API & business metrics", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }, "id": 200 },
+
+    {
+      "id": 10, "type": "timeseries", "title": "Backend request rate, by route",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "sum by (route) (rate(http_requests_total{job=\"backend\"}[5m]))", "legendFormat": "{{route}}" }]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Backend p95 latency, by route",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{job=\"backend\"}[5m])))", "legendFormat": "{{route}}" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Backend error rate (5xx)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "sum(rate(http_requests_total{job=\"backend\",status_code=~\"5..\"}[5m]))", "legendFormat": "5xx/sec" }]
+    },
+
+    {
+      "id": 13, "type": "bargauge", "title": "Weather searches by city (this window)",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "sum by (city) (increase(weather_search_requests_total[1h]))", "legendFormat": "{{city}}" }]
+    },
+    {
+      "id": 14, "type": "stat", "title": "Last known temperature, by city",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 23 },
+      "datasource": { "type": "prometheus" },
+      "targets": [{ "expr": "max by (city) (weather_current_temperature_celsius)", "legendFormat": "{{city}}" }],
+      "fieldConfig": { "defaults": { "unit": "celsius" }, "overrides": [] }
+    },
+    {
+      "id": 15, "type": "logs", "title": "Recent backend logs (Loki)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 23 },
+      "datasource": { "type": "loki" },
+      "targets": [{ "expr": "{job=\"backend\"}" }]
+    }
+  ]
+}

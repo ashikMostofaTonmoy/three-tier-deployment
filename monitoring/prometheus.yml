@@ -1,0 +1,52 @@
+# Prometheus's own config: how often to scrape, what to scrape, where the
+# alert rules live, and where to send anything that fires.
+#
+# "scrape" = Prometheus reaches OUT to each target and pulls its current
+# numbers (the "pull model" — see README §23). Every target below exposes a
+# plain-text /metrics page; Prometheus just fetches it on a timer and stores
+# what it sees as a time series.
+
+global:
+  scrape_interval: 15s      # how often to scrape every target, by default
+  evaluation_interval: 15s  # how often to check the alert rules in alert-rules.yml
+
+rule_files:
+  - "alert-rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+
+scrape_configs:
+  # Prometheus scrapes itself — the simplest possible target, and a good
+  # first thing to look at on the Targets page (it's always there).
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # SERVER monitoring: the host this whole stack runs on.
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+
+  # SERVER-ish: Nginx's own request/connection counters (the "frontend" tier).
+  - job_name: "nginx"
+    static_configs:
+      - targets: ["localhost:9113"]
+
+  # APPLICATION monitoring: our own backend's HTTP + business metrics.
+  # TWO targets, not one: the backend runs as 2 PM2 cluster workers, and
+  # each one has its OWN metrics registry in its own process memory (see the
+  # long comment in backend/src/metrics.js). Scraping only "the backend" on
+  # one shared port would silently see just whichever worker answered that
+  # connection. Scraping both workers as separate targets and combining them
+  # with `sum by (...)` in PromQL (see the dashboards) gives the real total.
+  - job_name: "backend"
+    static_configs:
+      - targets: ["localhost:9200", "localhost:9201"]
+
+  # SERVER-ish: Postgres internals (the "database" tier).
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["localhost:9187"]

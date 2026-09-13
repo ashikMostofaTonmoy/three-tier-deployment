@@ -1,0 +1,66 @@
+# Alert rules: PromQL expressions that, when true for at least `for:` long,
+# become a "firing" alert Prometheus hands to Alertmanager (README §37).
+#
+# The `for:` duration matters: without it, one bad scrape (a garbage
+# collection pause, a network blip) would page someone for nothing. `for:`
+# says "only alert if this has been true continuously for this long" —
+# noise reduction, not just syntax.
+
+groups:
+  - name: three-tier-lab-alerts
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target is down"
+          description: "{{ $labels.instance }} (job {{ $labels.job }}) has been unreachable for over a minute."
+
+      # Deliberately short `for:` — this is the one used for the live
+      # classroom demo (pm2 stop backend), so it fires fast enough to watch.
+      - alert: BackendDown
+        expr: up{job="backend"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend API is down"
+          description: "Prometheus has not been able to scrape the backend's /metrics for 30s+. The frontend's /api/* calls are almost certainly failing."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres is down"
+          description: "postgres_exporter cannot reach Postgres. Every backend request that touches the database will fail."
+
+      - alert: HighCPULoad
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU load on {{ $labels.instance }}"
+          description: "CPU busy % has been over 80 for 5+ minutes."
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Available memory has been below 15% for 5+ minutes."
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Root filesystem has less than 15% free space."
