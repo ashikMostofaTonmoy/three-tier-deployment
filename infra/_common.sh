@@ -7,6 +7,9 @@ set -euo pipefail
 AWS_PROFILE="${AWS_PROFILE:-ostad}"
 AWS_REGION="${AWS_REGION:-ap-southeast-1}"
 export AWS_PROFILE AWS_REGION
+# Windows' AWS CLI prints remote command output verbatim (e.g. package manager
+# checkmarks, emoji) — without this, non-ASCII bytes crash the CLI itself.
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
 # Names every script agrees on. Change the prefix if you want a second stack.
 PREFIX="${PREFIX:-three-tier}"

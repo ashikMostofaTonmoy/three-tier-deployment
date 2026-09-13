@@ -1,18 +1,19 @@
 # Frontend Development & AWS Deployment
 
 > A hands-on lab for the **DevOps Master** course.
-> You will build a small React app, then deploy it to AWS **five different ways** —
-> by hand, with a script, and fully automated with GitHub Actions — and understand
-> every moving part in between.
+> **Part 1** deploys just the frontend, by hand, with a script, and with GitHub
+> Actions. **Part 2** turns it into a **real three-tier app** (frontend + backend +
+> database) on one VM, and automates it **two different ways** so you can compare
+> them: a GitHub-hosted runner using OIDC + SSM, and a self-hosted runner.
 
-This is **Tier 1** (the web/frontend tier) of a bigger "three-tier" project.
-Later modules add a backend tier and a database tier; the repo is laid out so they
-slot in without moving anything.
+The repo is laid out as a "three-tier" project from the start — `frontend/` (Part 1),
+`backend/` + `database/` (Part 2) — so nothing moves as the lab grows.
 
 ---
 
 ## Table of contents
 
+**Part 1 — the frontend, on its own**
 1. [Overview & architecture](#1-overview--architecture)
 2. [Frontend architecture](#2-frontend-architecture)
 3. [Run it locally](#3-run-it-locally)
@@ -25,16 +26,30 @@ slot in without moving anything.
 10. [Full architecture view](#10-full-architecture-view)
 11. [Cleanup](#11-cleanup)
 
+**Part 2 — the full three-tier stack, on one VM, automated two ways**
+12. [Full three-tier architecture](#12-full-three-tier-architecture)
+13. [The backend tier](#13-the-backend-tier)
+14. [The database tier](#14-the-database-tier)
+15. [Deploying the full stack on your VM](#15-deploying-the-full-stack-on-your-vm)
+16. [Configuring AWS SSM](#16-configuring-aws-ssm)
+17. [Automating — Option A: GitHub-hosted runner + OIDC + SSM](#17-automating--option-a-github-hosted-runner--oidc--ssm)
+18. [Automating — Option B: a self-hosted runner](#18-automating--option-b-a-self-hosted-runner)
+19. [Option A vs Option B](#19-option-a-vs-option-b)
+20. [Full picture — everything, both paths](#20-full-picture--everything-both-paths)
+21. [Cleanup (Part 2)](#21-cleanup-part-2)
+
 ---
 
 ## ⚠️ Read this first — money and safety
 
 - This lab creates **real AWS resources** (one small EC2 server, a security group,
   an S3 bucket, an IAM role). Left running, the EC2 instance costs roughly
-  **US$0.30 per day** (`t3.micro` in `ap-southeast-1`). Everything else is
-  effectively free.
-- **When you finish for the day, run [section 11 — Cleanup](#11-cleanup).**
-  It deletes everything. You can rebuild it in ~3 minutes next time.
+  **US$0.30/day** for Part 1's `t3.micro`, or **US$0.60/day** for Part 2's
+  `t3.small` (needed once Postgres joins Nginx and Node on the box). Everything
+  else is effectively free.
+- **When you finish for the day, run [section 11](#11-cleanup) (Part 1) or
+  [section 21](#21-cleanup-part-2) (Part 2) — Cleanup.** It deletes everything.
+  You can rebuild it in a few minutes next time.
 - Never commit AWS keys, `.pem` files, or `infra/.lab-state` to git. The provided
   `.gitignore` already blocks them.
 
@@ -941,13 +956,550 @@ time while the lab ran. Confirm in the AWS Console → **Billing → Bills**.
 
 ---
 
+## 12. Full three-tier architecture
+
+**What you'll learn:** how the same app looks once it has a real backend and a
+real database, and why putting all three tiers on **one VM** is a legitimate,
+much simpler choice for a class like this.
+
+Part 1's Nginx proxied `/api/*` straight to Open-Meteo. Part 2 puts **your own
+backend** in between: the browser still only ever talks to Nginx, but now Nginx
+hands `/api/*` to a Node/Express service, which calls Open-Meteo itself and
+remembers every search in Postgres.
+
+```mermaid
+flowchart TD
+    subgraph vm["One EC2 instance (t3.small)"]
+        nginx["Nginx :80<br/>static files + /api/ proxy"]
+        backend["Backend (PM2, cluster mode)<br/>2x Node processes :3000"]
+        db[("Postgres :5432<br/>search_history")]
+        nginx -->|"proxy_pass 127.0.0.1:3000"| backend
+        backend -->|"localhost"| db
+    end
+    user["Browser"] -->|"http://SERVER/"| nginx
+    backend -->|"fetch()"| meteo["Open-Meteo API"]
+```
+
+Why one VM, honestly:
+- **Nothing new to expose.** Backend (3000) and Postgres (5432) bind to
+  `127.0.0.1` only — they never touch the security group. The SG is *exactly*
+  Part 1's: 22 from you, 80 from the world. Three tiers, same firewall surface
+  as one.
+- **No private-IP plumbing.** A multi-instance layout needs each tier to know
+  the others' private IPs, chained security groups, and Nginx configs templated
+  per-environment. On one box, `/api/` just proxies to `localhost:3000` —
+  always, everywhere, no templating.
+- **The same provisioning script.** `infra/01-ec2.sh --instance-type t3.small`
+  — the only thing that changed from Part 1 is the instance size (Postgres
+  needs headroom `t3.micro`'s 1GB doesn't comfortably have).
+
+This is a deliberate simplification for teaching, not a security shortcut —
+say so plainly if a student asks "isn't putting the database on the web server
+bad practice?" (Answer: in a real deployment you'd split tiers for
+independent scaling and blast-radius reasons, not because co-locating them is
+inherently insecure — the co-located version here still never exposes the
+backend or database to the network.)
+
+---
+
+## 13. The backend tier
+
+**What you'll learn:** what the one file that talks to both Open-Meteo and
+Postgres actually does, and why a failed "nice to have" must never break the
+main feature.
+
+Read [`backend/src/server.js`](backend/src/server.js) — three routes:
+
+| Route | Does |
+|---|---|
+| `GET /health` | `{"status":"ok"}` — for anything checking "is the process up" |
+| `GET /api/v1/forecast` | calls Open-Meteo itself (the browser never does), returns the weather, and **tries** to log the query to Postgres |
+| `GET /api/v1/history` | the last 10 logged queries |
+
+The important design choice is in `/api/v1/forecast`:
+
+```js
+if (upstream.ok) {
+  pool.query(`INSERT INTO search_history ...`, [...])
+    .catch((err) => console.error('history insert failed (non-fatal):', err.message));
+}
+res.status(upstream.status).json(data); // the weather is returned regardless
+```
+
+The `pool.query(...).catch(...)` is deliberately **not** `await`ed with a
+`try/catch` that could reach the response — a broken database must never turn
+a working weather lookup into a 500. This is the same instinct behind the
+frontend's `RecentSearches` component hiding itself instead of showing an
+error (§ frontend architecture) — a secondary feature failing should never be
+visible as a primary failure.
+
+**A bug worth knowing about** (found live while building this lab):
+[`backend/ecosystem.config.cjs`](backend/ecosystem.config.cjs) starts the app
+under PM2, but **PM2 does not read `.env` files** — only Node does, and only if
+told to. Without loading it, `DATABASE_URL` is silently `undefined` and every
+Postgres call fails with `SASL: client password must be a string`. The fix is
+one line at the top of `server.js`:
+
+```js
+import 'dotenv/config'; // loads .env into process.env — PM2 does not do this itself
+```
+
+If you ever see that exact SASL error with a working `.env` file on disk, this
+is almost always why — check the app is actually loading it.
+
+---
+
+## 14. The database tier
+
+**What you'll learn:** the one table this app needs, and how to look at it
+directly.
+
+[`database/migrations/001_create_search_history.sql`](database/migrations/001_create_search_history.sql):
+
+```sql
+CREATE TABLE IF NOT EXISTS search_history (
+    id          SERIAL PRIMARY KEY,
+    city        TEXT,
+    latitude    NUMERIC(9, 5) NOT NULL,
+    longitude   NUMERIC(9, 5) NOT NULL,
+    temperature NUMERIC(5, 2),
+    queried_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`IF NOT EXISTS` is what makes re-running the migration safe — every deploy
+(manual, scripted, or CI) re-applies it, and it's a no-op once the table
+exists. Real projects use a proper migration tool (Flyway, node-pg-migrate,
+Prisma Migrate) so schema changes are tracked and reversible one at a time;
+one file is enough for this class.
+
+Look at the data directly:
+
+```console
+$ sudo -u postgres psql -d three_tier -c '\dt'
+             List of relations
+ Schema |      Name      | Type  |  Owner
+--------+----------------+-------+----------
+ public | search_history | table | postgres
+
+$ sudo -u postgres psql -d three_tier -c 'SELECT city, temperature, queried_at FROM search_history ORDER BY queried_at DESC LIMIT 5;'
+   city    | temperature |          queried_at
+-----------+-------------+-------------------------------
+ London    |       20.20 | 2026-09-13 14:35:03.839+00
+ Singapore |       26.70 | 2026-09-13 14:34:34.215+00
+```
+
+---
+
+## 15. Deploying the full stack on your VM
+
+**What you'll learn:** bringing up all three tiers on one instance, and proving
+they actually talk to each other.
+
+**You need:** the `ostad` profile; nothing from Part 1 still running (or use a
+fresh instance — either is fine, they don't collide).
+
+### Provision a bigger box
+
+```bash
+./infra/01-ec2.sh --instance-type t3.small
+```
+
+Same script as Part 1's §5 — just a bigger instance type. Note the
+`PUBLIC_IP` it prints; you'll use it below.
+
+### Install once: Nginx, Postgres, Node, PM2
+
+```bash
+ssh -i infra/three-tier-key.pem ubuntu@<PUBLIC_IP>
+sudo apt-get update -y
+sudo apt-get install -y nginx postgresql
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+sudo npm install -g pm2
+```
+
+### Bring up each tier
+
+From your laptop:
+
+```bash
+scripts/deploy-db.sh          # installs the schema, prints a generated DB password
+scripts/deploy-backend.sh     # ships backend/, starts it under PM2 (cluster, 2 workers)
+scripts/deploy.sh             # ships the frontend build (same script Part 1 used)
+```
+
+One more one-time step on the server — the Part 2 Nginx config (proxies to
+your backend, not Open-Meteo):
+
+```bash
+scp -i infra/three-tier-key.pem nginx/three-tier-full.conf ubuntu@<PUBLIC_IP>:/tmp/three-tier.conf
+ssh -i infra/three-tier-key.pem ubuntu@<PUBLIC_IP> '
+  sudo cp /tmp/three-tier.conf /etc/nginx/sites-available/three-tier
+  sudo ln -sfn /etc/nginx/sites-available/three-tier /etc/nginx/sites-enabled/three-tier
+  sudo rm -f /etc/nginx/sites-enabled/default
+  sudo nginx -t && sudo systemctl reload nginx
+'
+```
+
+### Verify — the whole loop, end to end
+
+```console
+$ curl -s http://<PUBLIC_IP>/healthz
+ok
+$ curl -s "http://<PUBLIC_IP>/api/v1/forecast?latitude=51.5&longitude=-0.13&city=London&current=temperature_2m&timezone=auto"
+{"latitude":51.49,...,"current":{"temperature_2m":20.2,...}}
+$ curl -s http://<PUBLIC_IP>/api/v1/history
+{"rows":[{"city":"London","latitude":"51.50000","longitude":"-0.13000","temperature":"20.20","queried_at":"2026-09-13T14:35:03.839Z"}]}
+```
+
+Open `http://<PUBLIC_IP>/` in a browser: pick a city, and the **Recent
+searches** panel below the forecast fills in with real rows from Postgres —
+proof the request travelled browser → Nginx → backend → Postgres and back.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant N as Nginx
+    participant A as Backend (PM2)
+    participant P as Postgres
+    participant M as Open-Meteo
+    B->>N: GET /api/v1/forecast?...
+    N->>A: proxy_pass 127.0.0.1:3000
+    A->>M: fetch weather
+    M-->>A: weather JSON
+    A-->>N: weather JSON (immediately)
+    N-->>B: weather JSON
+    A->>P: INSERT INTO search_history (best-effort, after responding)
+    B->>N: GET /api/v1/history
+    N->>A: proxy_pass 127.0.0.1:3000
+    A->>P: SELECT ... ORDER BY queried_at DESC
+    P-->>A: rows
+    A-->>N: rows
+    N-->>B: rows
+```
+
+**If it breaks:**
+- `/api/v1/history` returns 500 with a SASL/password error → see the `.env`
+  loading bug in §13 — confirm `backend/src/server.js` has
+  `import 'dotenv/config'` at the top and you're running the current code.
+- `/api/v1/forecast` works but history stays empty → check
+  `sudo -u ubuntu -H pm2 logs backend` for the (non-fatal, logged) insert
+  error — usually a stale `DATABASE_URL` password after re-running
+  `scripts/deploy-db.sh` (it regenerates the password only if none exists yet;
+  re-run `scripts/deploy-backend.sh` after to pick up the current one).
+
+---
+
+## 16. Configuring AWS SSM
+
+**What you'll learn:** exactly what "the pipeline can run commands on your
+server without SSH" requires — spelled out, not treated as magic. This is a
+**one-time setup step you do yourself**, before any GitHub workflow exists.
+Read this once; both automation options (§17, §18) depend on it.
+
+### What it's for here
+
+Three things in this repo run commands on the instance with **no open SSH
+port and no distributed key**: the manual "just run this on the box" moments
+in §15 could always be SSH — but `scripts/deploy-db.sh` shows you can prefer
+SSM instead, and the OIDC/CI path in §17 has *no other way in*. SSM is what
+makes that possible.
+
+### The three ingredients
+
+1. **The SSM Agent**, running on the instance. Ubuntu's official AMI ships it
+   pre-installed — you don't do anything for this one. Verify:
+   ```console
+   $ ssh ... 'systemctl is-active amazon-ssm-agent || systemctl is-active snap.amazon-ssm-agent.amazon-ssm-agent'
+   active
+   ```
+2. **An IAM role + instance profile**, attached to the instance at launch,
+   granting the agent permission to talk to the SSM service. This is created
+   by `infra/01-ec2.sh` — here is the exact code (nothing hidden):
+   ```bash
+   aws iam create-role --role-name three-tier-ssm-role \
+     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[
+       {"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}
+     ]}'
+   aws iam attach-role-policy --role-name three-tier-ssm-role \
+     --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+   aws iam create-instance-profile --instance-profile-name three-tier-ssm-profile
+   aws iam add-role-to-instance-profile \
+     --instance-profile-name three-tier-ssm-profile --role-name three-tier-ssm-role
+   ```
+   Then the instance is launched with `--iam-instance-profile Name=three-tier-ssm-profile`.
+3. **Outbound network access** to AWS's SSM endpoints — already true of every
+   instance this repo launches (public subnet + internet gateway).
+
+### Verify the instance registered
+
+```console
+$ aws ssm describe-instance-information --profile ostad \
+    --filters "Key=InstanceIds,Values=i-0bc26c37b7fc66706" \
+    --query 'InstanceInformationList[0].PingStatus' --output text
+Online
+```
+
+`Online` means all three ingredients are in place. If it says nothing or
+times out, the instance profile likely didn't attach in time — wait ~30s
+after launch and retry (`infra/01-ec2.sh` already builds this wait in).
+
+### Why this matters for "IAM config outside CI/CD"
+
+`infra/01-ec2.sh` and `infra/02-cicd.sh` (§17 sets it up) are scripts **you
+run from your own machine, once**. Neither GitHub workflow in this repo
+creates, modifies, or even has permission to touch IAM — grep them and see for
+yourself, there is no `iam:Create*`/`iam:Attach*` anywhere in
+`.github/workflows/`. A workflow only ever **assumes** an already-existing
+role and **sends** an SSM command to an already-registered instance. If that
+role or registration doesn't exist yet, the workflow fails clearly — it never
+silently creates one.
+
+---
+
+## 17. Automating — Option A: GitHub-hosted runner + OIDC + SSM
+
+**What you'll learn:** letting GitHub's own runner deploy your full stack,
+never storing an AWS key anywhere.
+
+This reuses the *exact same* `infra/02-cicd.sh` from Part 1 — S3 bucket, GitHub
+OIDC provider, IAM role — nothing Part-2-specific to create. Re-run it (safe,
+idempotent) so the role's SSM permission still points at whichever instance
+you have running now:
+
+```bash
+./infra/02-cicd.sh <your-github-username>/three-tier-deployment
+```
+
+Set the four repo variables it prints (`AWS_REGION`, `AWS_ROLE_ARN`,
+`DEPLOY_BUCKET`, `EC2_INSTANCE_ID`) exactly as in Part 1 §9.
+
+[`.github/workflows/full-stack-oidc-ssm.yml`](.github/workflows/full-stack-oidc-ssm.yml)
+job by job:
+
+```mermaid
+sequenceDiagram
+    participant GH as GitHub Actions (ubuntu-latest)
+    participant AWS as AWS STS
+    participant S3 as S3 bucket
+    participant SSM as AWS SSM
+    participant EC2 as Your instance
+    GH->>GH: npm ci && build frontend; tar backend/
+    GH->>AWS: OIDC token -> temporary credentials
+    GH->>S3: upload frontend.tgz, backend.tgz, migration.sql
+    GH->>SSM: send-command (apply migration, pm2 startOrReload, swap symlink)
+    SSM->>EC2: runs it
+    EC2-->>SSM: done
+    GH->>EC2: curl / , /api/v1/forecast, /api/v1/history -> 200
+```
+
+One extra thing this workflow does that's worth pointing out: **it proves
+zero-downtime**, not just claims it. Before sending the deploy command, it
+starts a background loop hitting `/api/v1/history` every 0.2s; after the
+deploy, it fails the job if **any** of those requests weren't `200`.
+
+Trigger it and watch:
+
+```console
+$ gh workflow run full-stack-oidc-ssm.yml
+$ gh run watch
+
+✓ deploy in 44s
+  ✓ Build the frontend
+  ✓ Package the backend
+  ✓ Get temporary AWS credentials (OIDC)
+  ✓ Stage both artifacts in S3
+  ✓ Deploy all three tiers on the instance (one SSM command)
+  ✓ Check the zero-downtime watch log
+        --- response codes seen for /api/v1/history during the deploy ---
+             26 200
+        all requests were 200 — zero-downtime confirmed
+  ✓ Verify the live site
+        GET /                 -> 200
+        GET /api/v1/forecast   -> 200
+        GET /api/v1/history    -> 200
+        live build -> fb5d8b3-20260913T143527Z ✅
+```
+
+**No AWS credential of any kind lives in this repo or in GitHub secrets** —
+only the four *non-secret* repo Variables above, which are just IDs, not
+credentials.
+
+---
+
+## 18. Automating — Option B: a self-hosted runner
+
+**What you'll learn:** the other way to automate — put the runner *inside* the
+environment it deploys to, so the deploy step needs no cloud credentials at
+all.
+
+> **Lab simplification, stated plainly:** this puts the runner on the *same*
+> VM as the app, purely to avoid paying for a second instance in a classroom.
+> In a real team, a self-hosted runner is normally a separate, disposable
+> machine — never the production box it deploys to.
+
+### Install and register (one-time, outside any pipeline)
+
+```bash
+./infra/21-self-hosted-runner.sh <your-github-username>/three-tier-deployment
+```
+
+This fetches a short-lived registration token with `gh` (never stored),
+installs the GitHub Actions runner on your instance via SSM, and starts it as
+a systemd service. Verify:
+
+```console
+$ gh api repos/<user>/three-tier-deployment/actions/runners \
+    --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'
+{"busy":false,"labels":["self-hosted","Linux","X64","three-tier-lab"],"name":"three-tier-runner","status":"online"}
+```
+
+### The workflow
+
+[`.github/workflows/full-stack-self-hosted.yml`](.github/workflows/full-stack-self-hosted.yml)
+targets `runs-on: [self-hosted, three-tier-lab]`. Compare it line by line with
+Option A's workflow — **every AWS/OIDC step is simply gone**. Building and
+deploying the frontend is `npm run build` followed by a plain local `cp` (no
+upload — it's already the right machine); the backend and database steps are
+local `rsync`/`psql`/`pm2` calls instead of an SSM command.
+
+```console
+$ gh workflow run full-stack-self-hosted.yml
+$ gh run watch
+
+✓ deploy in 42s
+  ✓ Build the frontend (locally — no upload needed, same machine)
+  ✓ Apply the database migration
+  ✓ Deploy the backend (PM2 rolling reload)
+  ✓ Deploy the frontend (atomic symlink swap)
+  ✓ Check the zero-downtime watch log
+        all requests were 200 — zero-downtime confirmed
+  ✓ Verify (locally, on the box)
+        live build -> fb5d8b3-20260913T143909Z-selfhosted ✅
+```
+
+Confirm which runner actually ran it (not GitHub's shared pool):
+
+```console
+$ gh api repos/<user>/three-tier-deployment/actions/runs/<run-id>/jobs --jq '.jobs[].runner_name'
+three-tier-runner
+```
+
+---
+
+## 19. Option A vs Option B
+
+| | **A: GitHub-hosted + OIDC/SSM** | **B: Self-hosted runner** |
+|---|---|---|
+| Where the runner lives | GitHub's cloud, ephemeral | Your own machine, always on |
+| Credentials the deploy step needs | none stored — a 1-hour OIDC token | none at all — it's already inside |
+| How commands reach the server | AWS SSM (no open SSH) | local shell (same box) |
+| Cost while idle | $0 (free minutes) | you pay for the runner's host 24/7 |
+| Setup complexity | IAM role + OIDC provider (once) | install + register a runner (once); **you** patch/secure that machine |
+| Network exposure needed | none beyond what the app itself needs | none, if co-located like this lab |
+| Good fit when | standard case — ephemeral, low-maintenance | you need access to private/internal resources a cloud runner can't reach, custom hardware, or very long builds |
+
+Neither is "the automated way" — they're two answers to "where does the thing
+that deploys my app run?", and real teams pick based on network topology and
+who's willing to own patching a machine.
+
+---
+
+## 20. Full picture — everything, both paths
+
+```mermaid
+flowchart TD
+    subgraph gh["GitHub"]
+        repo["Repository"]
+        wfA["full-stack-oidc-ssm.yml"]
+        wfB["full-stack-self-hosted.yml"]
+    end
+
+    subgraph aws["AWS account — profile ostad"]
+        oidc["OIDC provider"] --> role["three-tier-deploy-role"]
+        s3["S3 staging bucket"]
+        ssm["AWS SSM"]
+        subgraph vm["EC2 t3.small"]
+            runner["self-hosted runner (systemd)"]
+            nginx["Nginx :80"]
+            backend["Backend, PM2 cluster :3000"]
+            db[("Postgres :5432")]
+            nginx --> backend --> db
+        end
+    end
+
+    repo --> wfA & wfB
+    wfA -->|OIDC| oidc
+    wfA -->|upload builds| s3
+    wfA -->|send-command| ssm --> vm
+    wfB -->|runs directly on| runner
+    runner -.->|local rsync/psql/pm2| backend
+    runner -.->|local cp + symlink| nginx
+
+    visitor["Browser"] -->|"http://IP/"| nginx
+    backend -->|fetch| meteo["Open-Meteo"]
+```
+
+| Component | Job | Inspect it |
+|---|---|---|
+| Nginx | static files + `/api/` proxy + SPA fallback | `sudo nginx -T`, `curl /healthz` |
+| Backend (PM2, cluster) | Tier 2 — calls Open-Meteo, writes/reads Postgres | `pm2 list`, `pm2 logs backend` |
+| Postgres | Tier 3 — `search_history` | `sudo -u postgres psql -d three_tier -c '\dt'` |
+| SSM Agent + role | lets AWS (and Option A's workflow) run commands, no SSH | `aws ssm describe-instance-information` |
+| S3 bucket | staging area for Option A's builds | `aws s3 ls s3://three-tier-deploy-<account>/` |
+| OIDC provider + role | what Option A's workflow assumes, no stored keys | `aws iam get-role --role-name three-tier-deploy-role` |
+| Self-hosted runner | Option B — runs GitHub Actions jobs locally | `gh api repos/<user>/<repo>/actions/runners` |
+
+---
+
+## 21. Cleanup (Part 2)
+
+**Run this when you're done with Part 2.** It removes everything, including
+the self-hosted runner:
+
+```bash
+scripts/cleanup.sh
+```
+
+```console
+  - self-hosted runner deregistered from <user>/three-tier-deployment
+Terminating instances…
+  - instance i-0bc26c37b7fc66706
+Deleting CI/CD resources…
+  - s3://three-tier-deploy-<account>
+  - role three-tier-deploy-role
+  - OIDC provider (created by this lab)
+Deleting instance resources…
+  - instance profile three-tier-ssm-profile
+  - role three-tier-ssm-role
+  - security group sg-...
+  - key pair three-tier-key
+Done. infra/.lab-state removed.
+```
+
+The runner is deregistered from GitHub **before** the instance is terminated,
+so it never lingers as a dead "offline" entry in your repo's runner list.
+
+Verify (same pattern as Part 1 §11):
+
+```bash
+P="--profile ostad --region ap-southeast-1"
+aws ec2 describe-instances $P --filters Name=tag:Name,Values=three-tier-web \
+  Name=instance-state-name,Values=running,pending --query 'Reservations[].Instances[].InstanceId'   # []
+aws s3 ls $P | grep three-tier                                                                       # (nothing)
+aws iam get-role --role-name three-tier-deploy-role $P 2>&1 | grep -o NoSuchEntity                   # NoSuchEntity
+gh api repos/<user>/three-tier-deployment/actions/runners --jq '.runners'                             # []
+```
+
+---
+
 ## Where this goes next
 
-- **Tier 2 — backend:** add an API service (Node/Express) on its own instance;
-  Nginx proxies `/api` to it instead of straight to Open-Meteo.
-- **Tier 3 — database:** add PostgreSQL; the backend talks to it over a private
-  security group.
-- **Docker:** package each tier as a container; deploy with `docker compose`.
-
-The folder layout (`frontend/`, `nginx/`, `scripts/`, `infra/`) already leaves room
-for `backend/` and `database/` beside it.
+- **Docker:** package each tier as a container; deploy with `docker compose`
+  instead of PM2 + apt-installed Postgres.
+- **A real domain + HTTPS:** certbot in front of Nginx, same pattern as many
+  reference deployments — deliberately left out here to keep the AWS surface
+  small for a frontend-focused class.
+- **Split the tiers across instances:** once "why one VM" (§12) makes sense,
+  try three instances + chained security groups as a follow-on exercise.
