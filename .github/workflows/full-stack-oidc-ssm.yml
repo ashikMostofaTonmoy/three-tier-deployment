@@ -9,23 +9,33 @@ name: Full stack deploy (GitHub-hosted runner, OIDC + SSM)
 # infra/02-cicd.sh (the same script Part 1 used; nothing to change for Part 2,
 # it already grants S3 + SSM on this one instance). This workflow only USES
 # that role — it has no permission to create or modify IAM.
+#
+# Triggered by workflow_dispatch by default (see the commented-out `push:`
+# block below for how to switch to push-to-deploy). Run it by hand:
+# `gh workflow run full-stack-oidc-ssm.yml`.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'frontend/**'
-      - 'backend/**'
-      - 'database/migrations/**'
-      - '.github/workflows/full-stack-oidc-ssm.yml'
+  # Push-trigger is commented out on purpose, not deleted — this and
+  # full-stack-self-hosted.yml both deploy to the SAME instance and share the
+  # concurrency group below, so if BOTH were push-triggered on the same commit
+  # they'd race/cancel each other. Uncomment this block on ONLY ONE of the two
+  # workflows if you want push-to-deploy; keep the other manual
+  # (workflow_dispatch), or point each at a different instance.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'frontend/**'
+  #     - 'backend/**'
+  #     - 'database/migrations/**'
+  #     - '.github/workflows/full-stack-oidc-ssm.yml'
 
 permissions:
   id-token: write
   contents: read
 
 concurrency:
-  group: full-stack-deploy-${{ github.ref }}
+  group: full-stack-deploy-oidc-ssm-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

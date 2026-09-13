@@ -11,19 +11,28 @@ name: Full stack deploy (self-hosted runner)
 # Both workflows end up managing the exact same PM2 process and Nginx release
 # folder (running as the "ubuntu" user) — only the *path the commands travel*
 # differs.
+#
+# Triggered by workflow_dispatch by default (see the commented-out `push:`
+# block below for how to switch to push-to-deploy). Run it by hand:
+# `gh workflow run full-stack-self-hosted.yml`.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'frontend/**'
-      - 'backend/**'
-      - 'database/migrations/**'
-      - '.github/workflows/full-stack-self-hosted.yml'
+  # Push-trigger is commented out on purpose, not deleted — this and
+  # full-stack-oidc-ssm.yml both deploy to the SAME instance and (each now
+  # has its own concurrency group below, but they'd still both run and could
+  # interleave writes) — if you want push-to-deploy, enable it on ONLY ONE of
+  # the two workflows, or point each at a different instance.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'frontend/**'
+  #     - 'backend/**'
+  #     - 'database/migrations/**'
+  #     - '.github/workflows/full-stack-self-hosted.yml'
 
 concurrency:
-  group: full-stack-deploy-${{ github.ref }}
+  group: full-stack-deploy-self-hosted-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
