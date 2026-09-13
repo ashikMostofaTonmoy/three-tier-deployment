@@ -16,9 +16,22 @@ PROFILE_NAME="$(state_get PROFILE_NAME)"
 KEY_NAME="$(state_get KEY_NAME)"
 BUCKET="$(state_get BUCKET)"
 CREATED_OIDC="$(state_get CREATED_OIDC)"
+GH_REPO="$(state_get GH_REPO)"
+RUNNER_INSTALLED="$(state_get RUNNER_INSTALLED)"
 OIDC_ARN="arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com"
 
 step() { echo "  - $*"; }
+
+# ---- deregister the self-hosted runner BEFORE terminating the instance it -
+# ---- lives on, so it doesn't linger as a dead "offline" runner on GitHub --
+if [ "$RUNNER_INSTALLED" = "true" ] && [ -n "$GH_REPO" ] && command -v gh >/dev/null 2>&1; then
+  RUNNER_ID="$(gh api "repos/${GH_REPO}/actions/runners" --jq \
+    '.runners[] | select(.name=="three-tier-runner") | .id' 2>/dev/null || true)"
+  if [ -n "$RUNNER_ID" ]; then
+    gh api -X DELETE "repos/${GH_REPO}/actions/runners/${RUNNER_ID}" \
+      && step "self-hosted runner deregistered from ${GH_REPO}" || true
+  fi
+fi
 
 # ---- also catch the userdata-test instance from the README, if present ----
 UDTEST="$(aws ec2 describe-instances \

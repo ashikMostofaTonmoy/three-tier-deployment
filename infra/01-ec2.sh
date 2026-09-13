@@ -7,8 +7,10 @@
 #    - one t3.micro EC2 instance   (Ubuntu 24.04)
 #
 #  Usage:
-#    ./01-ec2.sh                       # plain instance, deploy to it later
-#    ./01-ec2.sh --user-data FILE      # run FILE on first boot (self-deploy)
+#    ./01-ec2.sh                                # plain t3.micro, deploy to it later
+#    ./01-ec2.sh --user-data FILE               # run FILE on first boot (self-deploy)
+#    ./01-ec2.sh --instance-type t3.small       # bigger box (e.g. full 3-tier stack)
+#  (flags can be combined, in any order)
 #
 #  Writes all IDs to infra/.lab-state. Re-running is safe (it reuses what exists).
 #  Tear it all down with: ./teardown.sh
@@ -16,7 +18,14 @@
 source "$(dirname "$0")/_common.sh"
 
 USER_DATA_FILE=""
-[ "${1:-}" = "--user-data" ] && USER_DATA_FILE="${2:?path to user-data file}"
+INSTANCE_TYPE="t3.micro"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user-data)      USER_DATA_FILE="${2:?path to user-data file}"; shift 2 ;;
+    --instance-type)  INSTANCE_TYPE="${2:?e.g. t3.micro, t3.small}"; shift 2 ;;
+    *) echo "unknown flag: $1"; exit 1 ;;
+  esac
+done
 
 banner
 
@@ -99,7 +108,7 @@ if [ "$EXISTING" != "None" ] && [ -n "$EXISTING" ]; then
   echo "Instance         : $INSTANCE_ID (already running)"
 else
   RUN_ARGS=(
-    --image-id "$AMI_ID" --instance-type t3.micro
+    --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE"
     --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID"
     --iam-instance-profile Name="$PROFILE_NAME"
     --associate-public-ip-address
@@ -109,7 +118,7 @@ else
   [ -n "$USER_DATA_FILE" ] && RUN_ARGS+=(--user-data "file://${USER_DATA_FILE}")
   INSTANCE_ID="$(aws ec2 run-instances "${RUN_ARGS[@]}" \
     --query 'Instances[0].InstanceId' --output text)"
-  echo "Instance         : $INSTANCE_ID (launching)"
+  echo "Instance         : $INSTANCE_ID ($INSTANCE_TYPE, launching)"
 fi
 
 echo "Waiting for the instance to be running and healthy…"

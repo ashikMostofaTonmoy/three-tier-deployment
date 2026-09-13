@@ -1,0 +1,149 @@
+name: Full stack deploy (GitHub-hosted runner, OIDC + SSM)
+
+# Option A of two ways to automate the full three-tier stack. This job runs on
+# GitHub's own runner and never holds long-lived AWS credentials: it trades a
+# short-lived OIDC token for temporary ones, then reaches the VM only through
+# AWS SSM (no SSH key here at all). Compare with full-stack-self-hosted.yml.
+#
+# IAM/OIDC setup is NOT part of this file — it was done once, by hand, with
+# infra/02-cicd.sh (the same script Part 1 used; nothing to change for Part 2,
+# it already grants S3 + SSM on this one instance). This workflow only USES
+# that role — it has no permission to create or modify IAM.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'database/migrations/**'
+      - '.github/workflows/full-stack-oidc-ssm.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: full-stack-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          export BUILD_ID="${GITHUB_SHA::7}-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
+          npm run build
+          tar -C dist -czf ../frontend-dist.tgz .
+
+      - name: Package the backend
+        run: tar --exclude node_modules -czf backend-src.tgz -C backend .
+
+      - name: Get temporary AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Stage both artifacts in S3
+        run: |
+          aws s3 cp frontend-dist.tgz "s3://${{ vars.DEPLOY_BUCKET }}/releases/${GITHUB_SHA}/frontend.tgz"
+          aws s3 cp backend-src.tgz   "s3://${{ vars.DEPLOY_BUCKET }}/releases/${GITHUB_SHA}/backend.tgz"
+          aws s3 cp database/migrations/001_create_search_history.sql \
+            "s3://${{ vars.DEPLOY_BUCKET }}/releases/${GITHUB_SHA}/migration.sql"
+
+      - name: Watch /api/v1/history during the deploy (proves zero downtime)
+        run: |
+          IP=$(aws ec2 describe-instances --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "IP=$IP" >> "$GITHUB_ENV"
+          ( for i in $(seq 1 300); do
+              curl -s -o /dev/null -w "%{http_code}\n" "http://$IP/api/v1/history"
+              sleep 0.2
+            done > uptime-watch.log ) &
+          echo $! > watch.pid
+
+      - name: Deploy all three tiers on the instance (one SSM command)
+        env:
+          BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          SHA: ${{ github.sha }}
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          read -r -d '' REMOTE <<EOF || true
+          set -e
+          echo "--- migration ---"
+          aws s3 cp "s3://${BUCKET}/releases/${SHA}/migration.sql" /tmp/migration.sql
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -d three_tier -f /tmp/migration.sql
+
+          echo "--- backend ---"
+          aws s3 cp "s3://${BUCKET}/releases/${SHA}/backend.tgz" /tmp/backend.tgz
+          sudo tar -C /opt/three-tier-backend -xzf /tmp/backend.tgz
+          sudo chown -R ubuntu:ubuntu /opt/three-tier-backend
+          cd /opt/three-tier-backend && sudo -u ubuntu -H npm ci --omit=dev --silent
+          sudo -u ubuntu -H pm2 startOrReload ecosystem.config.cjs --update-env
+          sudo -u ubuntu -H pm2 save
+
+          echo "--- frontend ---"
+          aws s3 cp "s3://${BUCKET}/releases/${SHA}/frontend.tgz" /tmp/frontend.tgz
+          RELEASE=/var/www/three-tier/releases/\$(date -u +%Y%m%d%H%M%S)
+          sudo mkdir -p "\$RELEASE"
+          sudo tar -C "\$RELEASE" -xzf /tmp/frontend.tgz
+          sudo ln -sfn "\$RELEASE" /var/www/three-tier/current
+          sudo nginx -t && sudo systemctl reload nginx
+          cd /var/www/three-tier/releases && ls -1dt */ | tail -n +6 | xargs -r sudo rm -rf
+          rm -f /tmp/backend.tgz /tmp/frontend.tgz /tmp/migration.sql
+          echo "deployed \$(readlink -f /var/www/three-tier/current)"
+          EOF
+
+          jq -n --arg c "$REMOTE" '{commands: ($c | split("\n"))}' > params.json
+          CMD_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript --comment "full-stack deploy ${GITHUB_SHA::7}" \
+            --parameters file://params.json --query Command.CommandId --output text)
+
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            [ "$STATUS" != "Pending" ] && [ "$STATUS" != "InProgress" ] && break
+            sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text
+          [ "$STATUS" = "Success" ]
+
+      - name: Check the zero-downtime watch log
+        if: always()
+        run: |
+          kill "$(cat watch.pid)" 2>/dev/null || true
+          sleep 1
+          echo "--- response codes seen for /api/v1/history during the deploy ---"
+          sort uptime-watch.log | uniq -c
+          if grep -qv '^200$' uptime-watch.log; then
+            echo "::error::non-200 response seen during deploy — NOT zero-downtime"
+            exit 1
+          fi
+          echo "all requests were 200 — zero-downtime confirmed"
+
+      - name: Verify the live site
+        run: |
+          curl -sf -o /dev/null -w 'GET /                 -> %{http_code}\n' "http://$IP/"
+          curl -sf -o /dev/null -w 'GET /api/v1/forecast   -> %{http_code}\n' \
+            "http://$IP/api/v1/forecast?latitude=1.35&longitude=103.82&current=temperature_2m&timezone=auto"
+          curl -sf -o /dev/null -w 'GET /api/v1/history    -> %{http_code}\n' "http://$IP/api/v1/history"
+          JS=$(curl -s "http://$IP/" | grep -o 'assets/index-[^"]*\.js')
+          curl -s "http://$IP/$JS" | grep -q "$BUILD_ID" \
+            && echo "live build -> $BUILD_ID ✅" \
+            || { echo "instance is not serving $BUILD_ID"; exit 1; }

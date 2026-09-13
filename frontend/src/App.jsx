@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import CityPicker, { CITIES } from './components/CityPicker.jsx';
 import WeatherCard from './components/WeatherCard.jsx';
+import RecentSearches from './components/RecentSearches.jsx';
 import BuildInfo from './components/BuildInfo.jsx';
 import { getForecast } from './api.js';
 
@@ -51,6 +52,8 @@ export default function App() {
         )}
         {!loading && !error && data && <WeatherCard city={cityName} data={data} />}
       </main>
+
+      {!loading && !error && data && <RecentSearches refreshKey={`${cityName}-${data.current?.time}`} />}
 
       <BuildInfo />
     </div>

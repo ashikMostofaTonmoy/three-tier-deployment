@@ -1,0 +1,104 @@
+name: Full stack deploy (self-hosted runner)
+
+# Option B of two ways to automate the full three-tier stack. This job runs
+# ON the same VM that hosts the app (installed once by
+# infra/21-self-hosted-runner.sh). Compare with full-stack-oidc-ssm.yml:
+# there is NO OIDC step and NO AWS credential of any kind in this file — the
+# runner is already inside the machine it's deploying to, so "deploy" is just
+# local shell commands. The trade-off: this VM now has to stay up 24/7 to keep
+# a runner listening, which a GitHub-hosted runner never requires.
+#
+# Both workflows end up managing the exact same PM2 process and Nginx release
+# folder (running as the "ubuntu" user) — only the *path the commands travel*
+# differs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'database/migrations/**'
+      - '.github/workflows/full-stack-self-hosted.yml'
+
+concurrency:
+  group: full-stack-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, three-tier-lab]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build the frontend (locally — no upload needed, same machine)
+        working-directory: frontend
+        run: |
+          npm ci
+          export BUILD_ID="${GITHUB_SHA::7}-$(date -u +%Y%m%dT%H%M%SZ)-selfhosted"
+          echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
+          npm run build
+
+      - name: Watch /api/v1/history during the deploy (proves zero downtime)
+        run: |
+          ( for i in $(seq 1 300); do
+              curl -s -o /dev/null -w "%{http_code}\n" "http://localhost/api/v1/history"
+              sleep 0.2
+            done > uptime-watch.log ) &
+          echo $! > watch.pid
+
+      - name: Apply the database migration
+        run: |
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -d three_tier \
+            < database/migrations/001_create_search_history.sql
+
+      - name: Deploy the backend (PM2 rolling reload)
+        run: |
+          command -v rsync >/dev/null || sudo apt-get install -y -qq rsync
+          sudo rsync -a --delete --exclude node_modules --exclude .env \
+            backend/ /opt/three-tier-backend/
+          sudo chown -R ubuntu:ubuntu /opt/three-tier-backend
+          cd /opt/three-tier-backend
+          sudo -u ubuntu -H npm ci --omit=dev --silent
+          sudo -u ubuntu -H pm2 startOrReload ecosystem.config.cjs --update-env
+          sudo -u ubuntu -H pm2 save
+
+      - name: Deploy the frontend (atomic symlink swap)
+        working-directory: frontend
+        run: |
+          RELEASE="/var/www/three-tier/releases/$(date -u +%Y%m%d%H%M%S)"
+          sudo mkdir -p "$RELEASE"
+          sudo cp -r dist/. "$RELEASE/"
+          sudo ln -sfn "$RELEASE" /var/www/three-tier/current
+          sudo nginx -t && sudo systemctl reload nginx
+          cd /var/www/three-tier/releases && ls -1dt */ | tail -n +6 | xargs -r sudo rm -rf
+          echo "deployed $(readlink -f /var/www/three-tier/current)"
+
+      - name: Check the zero-downtime watch log
+        if: always()
+        run: |
+          kill "$(cat watch.pid)" 2>/dev/null || true
+          sleep 1
+          echo "--- response codes seen for /api/v1/history during the deploy ---"
+          sort uptime-watch.log | uniq -c
+          if grep -qv '^200$' uptime-watch.log; then
+            echo "::error::non-200 response seen during deploy — NOT zero-downtime"
+            exit 1
+          fi
+          echo "all requests were 200 — zero-downtime confirmed"
+
+      - name: Verify (locally, on the box)
+        run: |
+          curl -sf -o /dev/null -w 'GET /                 -> %{http_code}\n' "http://localhost/"
+          curl -sf -o /dev/null -w 'GET /api/v1/forecast   -> %{http_code}\n' \
+            "http://localhost/api/v1/forecast?latitude=51.5&longitude=-0.13&current=temperature_2m&timezone=auto"
+          curl -sf -o /dev/null -w 'GET /api/v1/history    -> %{http_code}\n' "http://localhost/api/v1/history"
+          JS=$(curl -s "http://localhost/" | grep -o 'assets/index-[^"]*\.js')
+          curl -s "http://localhost/$JS" | grep -q "$BUILD_ID" \
+            && echo "live build -> $BUILD_ID ✅" \
+            || { echo "instance is not serving $BUILD_ID"; exit 1; }
