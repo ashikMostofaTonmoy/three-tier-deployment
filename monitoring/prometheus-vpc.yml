@@ -1,0 +1,53 @@
+# Part 5/6 variant of monitoring/prometheus.yml. Part 3/4 scraped everything
+# over "localhost" because it was all one VM. Now the frontend and backend
+# are separate instances, so the frontend's exporters are scraped over its
+# PRIVATE IP instead — scripts/deploy-monitoring-vpc.sh replaces the literal
+# text FRONTEND_PRIVATE_IP below with the real address before installing
+# this. This file lives and runs entirely on the BACKEND instance.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert-rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # SERVER monitoring: the backend host itself.
+  - job_name: "node-backend"
+    static_configs:
+      - targets: ["localhost:9100"]
+
+  # SERVER monitoring: the FRONTEND host — scraped across the network, over
+  # its private IP. Requires the frontend-sg rule from 42-security-groups.sh
+  # allowing the backend-sg in on 9100.
+  - job_name: "node-frontend"
+    static_configs:
+      - targets: ["FRONTEND_PRIVATE_IP:9100"]
+
+  # The "frontend" tier's own metrics: Nginx's request/status counters,
+  # scraped over the network the same way. Requires the 9113 SG rule.
+  - job_name: "nginx"
+    static_configs:
+      - targets: ["FRONTEND_PRIVATE_IP:9113"]
+
+  # APPLICATION monitoring: our own backend, both PM2 cluster workers.
+  - job_name: "backend"
+    static_configs:
+      - targets: ["localhost:9200", "localhost:9201"]
+
+  # DATABASE monitoring: postgres_exporter runs HERE (on the backend), but
+  # its DATA_SOURCE_NAME points at the RDS endpoint — the exporter's own
+  # location and the database's location are two different things.
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["localhost:9187"]

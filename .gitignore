@@ -22,4 +22,6 @@ infra/.lab-state
 
 # never commit infra state / private key
 infra/.lab-state
+infra/.lab-state-vpc
 infra/*.pem
+infra/.ssm-params*.json

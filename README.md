@@ -61,6 +61,30 @@ The repo is laid out as a "three-tier" project from the start — `frontend/` (P
 37. [Setting Up Alerts for Application Health](#37-setting-up-alerts-for-application-health)
 38. [Full picture (Parts 1–4) + Cleanup](#38-full-picture-parts-14--cleanup)
 
+**Part 5 — Basic 3-Tier Architecture (Public + Private Subnets)**
+39. [Understanding AWS VPC Architecture](#39-understanding-aws-vpc-architecture)
+40. [Creating a Custom VPC](#40-creating-a-custom-vpc)
+41. [Public and Private Subnet Design](#41-public-and-private-subnet-design)
+42. [Internet Gateway and Route Tables](#42-internet-gateway-and-route-tables)
+43. [NAT Gateway for Private Subnet Internet Access](#43-nat-gateway-for-private-subnet-internet-access)
+44. [Security Groups Configuration for Each Tier](#44-security-groups-configuration-for-each-tier)
+45. [Deploy the Frontend in the Public Subnet](#45-deploy-the-frontend-in-the-public-subnet)
+46. [Deploy the Backend in the Private Subnet](#46-deploy-the-backend-in-the-private-subnet)
+47. [Deploy the Database with Amazon RDS](#47-deploy-the-database-with-amazon-rds)
+48. [Wiring Monitoring Onto the New Topology](#48-wiring-monitoring-onto-the-new-topology)
+49. [Verify End-to-End + Cleanup (Part 5)](#49-verify-end-to-end--cleanup-part-5)
+
+**Part 6 — Production-Ready 3-Tier (Fully Private + Load Balancer)**
+50. [Moving the Frontend to a Private Subnet](#50-moving-the-frontend-to-a-private-subnet)
+51. [Introduction to AWS Load Balancers](#51-introduction-to-aws-load-balancers)
+52. [Application Load Balancer Setup](#52-application-load-balancer-setup)
+53. [Target Groups Configuration](#53-target-groups-configuration)
+54. [Deploy the Frontend in the Private Subnet](#54-deploy-the-frontend-in-the-private-subnet)
+55. [Expose the Application Through the ALB](#55-expose-the-application-through-the-alb)
+56. [Testing End-to-End Connectivity](#56-testing-end-to-end-connectivity)
+57. [Network Security Best Practices](#57-network-security-best-practices)
+58. [Full Picture (Parts 5–6) + Cleanup](#58-full-picture-parts-56--cleanup)
+
 ---
 
 ## ⚠️ Read this first — money and safety
@@ -70,9 +94,16 @@ The repo is laid out as a "three-tier" project from the start — `frontend/` (P
   **US$0.30/day** for Part 1's `t3.micro`, or **US$0.60/day** for Part 2's
   `t3.small` (needed once Postgres joins Nginx and Node on the box). Everything
   else is effectively free.
-- **When you finish for the day, run [section 11](#11-cleanup) (Part 1) or
-  [section 21](#21-cleanup-part-2) (Part 2) — Cleanup.** It deletes everything.
-  You can rebuild it in a few minutes next time.
+- **Parts 5-6 cost meaningfully more** — a NAT Gateway (~US$0.06/hr), an RDS
+  `db.t3.micro` (~US$0.02/hr), and (Part 6 only) an Application Load Balancer
+  (~US$0.025/hr), on top of two EC2 instances. All-in, roughly **US$3-4/day**
+  while it's running — an order of magnitude past Parts 1-4. Don't leave it up
+  overnight by accident.
+- **When you finish for the day, run the cleanup section for the part you're
+  on** — [§11](#11-cleanup) (Part 1), [§21](#21-cleanup-part-2) (Part 2),
+  [§38](#38-full-picture-parts-14--cleanup) (Parts 3-4), or
+  [§58](#58-full-picture-parts-56--cleanup) (Parts 5-6). Each deletes
+  everything that part created. You can rebuild it in a few minutes next time.
 - Never commit AWS keys, `.pem` files, or `infra/.lab-state` to git. The provided
   `.gitignore` already blocks them.
 
@@ -2149,17 +2180,828 @@ gone, but the webhook itself lives in Slack until you delete it there.
 
 ---
 
+## 39. Understanding AWS VPC Architecture
+
+**What you'll learn:** what a VPC actually is, and why splitting an app across
+subnets is worth the extra complexity.
+
+Every EC2 instance so far (Parts 1-4) lived in your account's **default VPC** —
+AWS creates one automatically, with one subnet per Availability Zone, all
+public, all on one flat network. Fine for a single-VM lab; not how a real app
+is laid out.
+
+A **VPC** (Virtual Private Cloud) is your own private slice of AWS network —
+you choose its IP range (a **CIDR block**, e.g. `10.0.0.0/16` = every address
+from `10.0.0.0` to `10.0.255.255`, about 65,000 addresses) and everything
+inside it. A **subnet** is a smaller slice of that range, pinned to one
+**Availability Zone** (AZ — one of several physically separate data centers
+in a region, so a fire/power outage in one doesn't take out the others). You
+put different tiers in different subnets **so a network rule, not just an
+application setting, decides what can reach what**:
+
+```mermaid
+flowchart TD
+    subgraph bad["Parts 1-4: one flat network"]
+        b1["frontend"] --- b2["backend"] --- b3["database"]
+        note1["A bug or a stolen key on ANY tier is\none hop from the database."]
+    end
+    subgraph good["Parts 5-6: tiered subnets"]
+        g1["frontend<br/>(public)"] --> g2["backend<br/>(private)"] --> g3["database<br/>(private)"]
+        note2["The database is unreachable from\nanywhere except the backend's subnet<br/>— not by policy, by network topology."]
+    end
+```
+
+This is **defense in depth**: even if the frontend is compromised, the
+attacker is still on the *other side* of a security group from the database —
+they'd need to also compromise the backend first. Parts 1-4 didn't have this
+property at all; a single VM has no internal network boundary between tiers
+running on it.
+
+---
+
+## 40. Creating a Custom VPC
+
+**What you'll learn:** standing up the network itself, before anything runs
+inside it.
+
+```bash
+./infra/40-vpc.sh
+```
+
+Creates one VPC (`10.0.0.0/16`) and six subnets across 2 AZs:
+
+```console
+$ ./infra/40-vpc.sh
+VPC              : vpc-07cff05d9fa4bb365 (created)
+AZs              : ap-southeast-1a / ap-southeast-1b
+  + three-tier-vpc-public-a (subnet-0a6be9..., 10.0.0.0/24, ap-southeast-1a)
+  + three-tier-vpc-public-b (subnet-014df0..., 10.0.1.0/24, ap-southeast-1b)
+  + three-tier-vpc-private-app-a (subnet-00758e..., 10.0.10.0/24, ap-southeast-1a)
+  + three-tier-vpc-private-app-b (subnet-01ecef..., 10.0.11.0/24, ap-southeast-1b)
+  + three-tier-vpc-private-db-a (subnet-07ba42..., 10.0.20.0/24, ap-southeast-1a)
+  + three-tier-vpc-private-db-b (subnet-07fe06..., 10.0.21.0/24, ap-southeast-1b)
+Internet Gateway : igw-07346871e39853ce1 (created + attached)
+Public route tbl : rtb-03e2a5ee... (created, 0.0.0.0/0 -> igw-..., associated to public-a/b)
+```
+
+Two AZs, from the start, even though Part 5 only launches one instance per
+tier: Part 6's Application Load Balancer *requires* subnets in at least 2 AZs,
+and RDS's subnet group (§47) requires it too, even for a single-AZ database.
+Building this once now means Part 6 reuses the exact same VPC unchanged.
+
+---
+
+## 41. Public and Private Subnet Design
+
+**What you'll learn:** the single idea that makes "public" vs "private" stop
+being a magic label — **it's the route table, nothing else.**
+
+A subnet has no "public" or "private" flag anywhere in AWS. What makes
+`public-a` public is that its **route table** sends internet-bound traffic
+(`0.0.0.0/0`, "anywhere") to an Internet Gateway. `private-app-a` will become
+"private" in §43 purely because *its* route table sends that same traffic to
+a NAT Gateway instead — nothing about the subnet definition itself changes.
+
+Compare the two route tables after this section and §43:
+
+```console
+$ aws ec2 describe-route-tables --route-table-ids rtb-03e2a5ee...   # public-rt
+Routes: 10.0.0.0/16 -> local          0.0.0.0/0 -> igw-07346871e39853ce1
+
+$ aws ec2 describe-route-tables --route-table-ids rtb-095f191c...   # private-rt (after §43)
+Routes: 10.0.0.0/16 -> local          0.0.0.0/0 -> nat-024c2edfd085cceb6
+```
+
+Same shape, different target. This is also *why* Part 6 can "move the
+frontend to a private subnet" (§50) without touching a single line of the
+frontend's own config — moving an instance from `public-a` to
+`private-app-a` only changes which route table applies to it.
+
+---
+
+## 42. Internet Gateway and Route Tables
+
+**What you'll learn:** what an IGW actually is (not a box with an IP).
+
+An **Internet Gateway** is a horizontally-scaled, managed, highly-available
+door between your VPC and the internet — attach one to a VPC, add a route to
+it, and any subnet using that route table can reach (and be reached from, if
+it also has a public IP) the internet. There's no capacity to size, no
+instance to patch; `infra/40-vpc.sh` already created and attached
+`igw-07346871e39853ce1` and built the public route table pointing at it.
+
+The other half of "public": a public *subnet* still needs each instance in it
+to actually have a public IP — that's `--map-public-ip-on-launch`, which
+`40-vpc.sh` set on both public subnets. A route to the internet with no
+public IP to use is as useless as a public IP with no route.
+
+---
+
+## 43. NAT Gateway for Private Subnet Internet Access
+
+**What you'll learn:** why a *private* instance still needs the internet —
+just never as a destination, only as a source.
+
+The backend (private, §46) needs to `apt-get`, `npm ci`, and call
+Open-Meteo — all outbound. It must never accept an inbound connection
+initiated *from* the internet. A NAT Gateway gives exactly that asymmetry: it
+sits in a **public** subnet, and private subnets route `0.0.0.0/0` through it
+instead of straight to an IGW. Return traffic for a connection the private
+instance opened gets back to it; a stranger on the internet trying to open a
+*new* connection to it has no route at all.
+
+```bash
+./infra/41-nat-gateway.sh
+```
+
+```console
+$ ./infra/41-nat-gateway.sh
+Elastic IP       : eipalloc-0480e4ad32a2698bc (allocated)
+NAT Gateway      : nat-024c2edfd085cceb6 (creating, in subnet-0a6be9...)
+waiting for NAT Gateway to become available......... -> available
+Private route tbl: rtb-095f191c... (created, 0.0.0.0/0 -> nat-024c2edfd085cceb6, associated to all 4 private subnets)
+```
+
+**Cost, stated plainly**: this is the single most expensive thing in this
+repo — roughly US$0.06/hr just for the NAT Gateway existing, plus a small
+per-GB charge for data it processes. A real production VPC typically runs
+**one NAT Gateway per AZ** (so an AZ outage doesn't strand every private
+subnet's internet access); this lab uses **one**, to halve that cost, since
+teaching NAT redundancy is a different lesson from teaching what NAT does.
+
+**Proof it works**, without waiting for §46: once the backend instance
+launches into a private subnet with no public IP at all, its SSM Agent still
+has to reach AWS's SSM endpoints over the internet — if the NAT Gateway
+wasn't working, the instance would never show `PingStatus: Online`. It did:
+
+```console
+$ aws ssm describe-instance-information --filters "Key=InstanceIds,Values=i-04443cc6fdea9946e" \
+    --query "InstanceInformationList[0].PingStatus" --output text
+Online
+```
+
+That's the NAT Gateway, working, before you've deployed a single line of app code.
+
+---
+
+## 44. Security Groups Configuration for Each Tier
+
+**What you'll learn:** the chain that makes least-privilege real, not just a
+slide.
+
+```bash
+./infra/42-security-groups.sh
+```
+
+```mermaid
+flowchart LR
+    world(("🌐 world")) -->|":80"| fsg["frontend-sg"]
+    fsg -->|":3000"| bsg["backend-sg"]
+    bsg -->|":5432"| dsg["db-sg"]
+    bsg -.->|":9100/:9113<br/>(monitoring, §48)"| fsg
+    alb["alb-sg<br/>(Part 6 only)"] -->|":80"| fsg
+    world -.->|":80, Part 6 only"| alb
+```
+
+Four security groups, one per tier plus one for the (not-yet-used-until Part
+6) ALB:
+
+```console
+$ ./infra/42-security-groups.sh
+  + three-tier-vpc-alb-sg (sg-03e4782f95bdd38cb)
+  + three-tier-vpc-frontend-sg (sg-0753f70cb8a3423ef)
+  + three-tier-vpc-backend-sg (sg-0c5c60afde8705d6d)
+  + three-tier-vpc-db-sg (sg-0044021458d213386)
+Rules:
+    + sg-03e4782f... allow tcp/80 from 0.0.0.0/0 (http-public)
+    + sg-0753f70c... allow tcp/80 from 0.0.0.0/0 (http-public-class5-direct)
+    + sg-0753f70c... allow tcp/80 from sg-03e4782f... (http-from-alb-class6)
+    + sg-0c5c60af... allow tcp/3000 from sg-0753f70c... (api-from-frontend)
+    + sg-0044021... allow tcp/5432 from sg-0c5c60af... (postgres-from-backend)
+    + sg-0753f70c... allow tcp/9100 from sg-0c5c60af... (node-exporter-scrape-from-backend)
+    + sg-0753f70c... allow tcp/9113 from sg-0c5c60af... (nginx-exporter-scrape-from-backend)
+```
+
+Notice **no port 22 rule anywhere** — the "pure SSM" decision means SSH is
+never opened at all, on any tier, in either class. The SSM Agent calls *out*
+to AWS; nothing needs to call *in*.
+
+**A real gotcha, found live**: security group changes don't affect
+connections that are already open — SGs are stateful and only evaluate a
+*new* connection attempt. Revoking a rule while a scrape connection is
+already established won't drop it; the target keeps showing `up` until
+something forces a fresh connection. Proven directly:
+
+```console
+$ aws ec2 revoke-security-group-ingress --group-id sg-0753f70c... --protocol tcp --port 9100 --source-group sg-0c5c60af...
+$ # ... Prometheus target stayed "up" for over a minute — the existing connection kept working ...
+$ sudo systemctl restart prometheus   # forces a brand-new connection attempt
+$ # ... target now: "down" ...
+$ aws ec2 authorize-security-group-ingress --group-id sg-0753f70c... --protocol tcp --port 9100 --source-group sg-0c5c60af...
+$ # ... target: "up" again, immediately (new connections are allowed right away) ...
+```
+
+The lesson: **don't trust "it's still working" as proof a security group
+change did nothing** — test with a fresh connection.
+
+---
+
+## 45. Deploy the Frontend in the Public Subnet
+
+**What you'll learn:** launching into the new VPC, and the "pure SSM, even
+here" choice made concrete.
+
+```bash
+./infra/44-ec2-instances.sh
+```
+
+Launches the backend into `private-app-a` and the frontend into `public-a`
+(the default), plus a small S3 "deploy bucket" both instances can read —
+because every deploy from here on goes through **SSM send-command**, never
+SSH or `scp`, even for Class 5's frontend which technically has a public IP
+you *could* SSH to. Consistency with Class 6 (where nothing has a public IP)
+beats convenience here.
+
+```console
+$ ./infra/44-ec2-instances.sh
+Backend instance : i-04443cc6fdea9946e (private-app-a, t3.medium)
+Frontend instance: i-01d2e1727edaf47e2 (public subnet, t3.micro)
+Waiting for both instances to be running and healthy…
+
+  DONE.
+  Backend  : i-04443cc6fdea9946e   private IP 10.0.10.89   (no public IP — SSM only)
+  Frontend : i-01d2e1727edaf47e2   private IP 10.0.0.84   public IP: 52.221.247.255
+```
+
+```bash
+scripts/deploy-frontend-vpc.sh
+```
+
+Builds the frontend, ships it to S3, then an SSM command on the instance
+pulls it down, installs Nginx, and deploys it — same atomic release+symlink
+pattern as Part 2. Verified from the real public IP:
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" http://52.221.247.255/
+200
+```
+
+---
+
+## 46. Deploy the Backend in the Private Subnet
+
+**What you'll learn:** the first real payoff of Part 3 §16's SSM investment —
+this instance has **no other way in at all**.
+
+```bash
+scripts/deploy-backend-vpc.sh
+```
+
+Same script family as §45, targeting the backend instance instead. There is
+no SSH key that reaches `i-04443cc6fdea9946e` — no public IP exists for it to
+listen on. Every single command that touched this box, from here through the
+rest of this README, went over `aws ssm send-command`. That the backend runs
+at all — installs Node, builds, connects to a database on a completely
+different host — using *only* that channel is the proof the design works,
+not an assertion:
+
+```console
+$ scripts/deploy-backend-vpc.sh
+...
+[PM2] App [backend] launched (2 instances)
+local backend /health -> 200
+```
+
+---
+
+## 47. Deploy the Database with Amazon RDS
+
+**What you'll learn:** what changes (and what doesn't) when a database is a
+managed service instead of a process you `apt-get install`ed yourself.
+
+```bash
+./infra/43-rds.sh
+```
+
+```console
+$ ./infra/43-rds.sh
+DB subnet group  : three-tier-vpc-db-subnet-group (created, spans 2 AZs)
+RDS instance     : three-tier-vpc-db (creating — this takes 5-10 minutes)
+waiting for RDS instance to become available......................... -> available
+
+  DONE.
+  Endpoint          : three-tier-vpc-db.cpkmy4y2wy3q.ap-southeast-1.rds.amazonaws.com:5432
+  Publicly reachable: False   (must be False)
+  Only reachable from security group sg-0044021458d213386 (i.e. the backend instance).
+```
+
+There is **no shell on an RDS instance** — no SSH, no SSM, nothing. Every
+interaction happens over the Postgres wire protocol itself (`psql`, or the
+app's own driver) or the AWS API (start/stop/resize/snapshot). In exchange,
+AWS handles patching and taking backups for you — the trade a managed
+database always makes.
+
+```bash
+scripts/deploy-db-vpc.sh
+```
+
+Applies the schema — from the **backend** instance, over SSM, because RDS
+has nowhere to run `psql` itself:
+
+```console
+$ scripts/deploy-db-vpc.sh
+==> applying schema to three-tier-vpc-db.cpkmy4y2wy3q.ap-southeast-1.rds.amazonaws.com (via the backend instance, over SSM)
+CREATE TABLE
+CREATE INDEX
+                 List of relations
+ Schema |      Name      | Type  |      Owner
+--------+----------------+-------+-----------------
+ public | search_history | table | three_tier_user
+```
+
+**A real gotcha, found live**: RDS requires SSL by default; the app's first
+connection attempt failed with `no pg_hba.conf entry for host "10.0.10.89"
+... no encryption`. `node-postgres` does **not** turn SSL on just because
+`DATABASE_URL` points at RDS — it's a separate option. Fixed in
+[`backend/src/db.js`](backend/src/db.js):
+
+```js
+ssl: process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : false,
+```
+
+with `PGSSL=true` set only in this module's `.env` (Part 2's local Postgres
+still runs with no SSL, unaffected). `rejectUnauthorized: false` skips
+validating RDS's certificate chain — acceptable for a class lab; real
+production would verify against RDS's published CA bundle instead.
+
+Full loop, verified from the frontend's public IP:
+
+```console
+$ curl -s "http://52.221.247.255/api/v1/forecast?latitude=23.81&longitude=90.41&city=Dhaka&current=temperature_2m&timezone=auto"
+{"latitude":23.8,...,"current":{"temperature_2m":27.7,...}}
+$ curl -s http://52.221.247.255/api/v1/history
+{"rows":[{"city":"Dhaka",...,"temperature":"27.70",...}]}
+```
+
+Browser → Nginx (public) → Node (private) → Postgres (managed, private) →
+back — three tiers, three subnets, one request.
+
+---
+
+## 48. Wiring Monitoring Onto the New Topology
+
+**What you'll learn:** why Part 3/4's monitoring stack needs to change shape
+once tiers are separate machines — not just move house.
+
+Part 3/4 scraped everything over `localhost` because it was all one VM. That
+literally cannot work anymore: the frontend and backend are different
+machines. The fix, in
+[`monitoring/prometheus-vpc.yml`](monitoring/prometheus-vpc.yml):
+
+```yaml
+- job_name: "node-frontend"
+  static_configs:
+    - targets: ["10.0.10.249:9100"]     # the frontend's PRIVATE IP, not localhost
+- job_name: "nginx"
+  static_configs:
+    - targets: ["10.0.10.249:9113"]
+```
+
+For that to actually connect, the frontend's exporters have to (a) listen on
+more than just `127.0.0.1`, and (b) be allowed in by a security group rule —
+both already set up: `0.0.0.0` binding in the exporter's systemd unit, and
+the `frontend-sg` rules from §44 allowing `backend-sg` in on 9100/9113. **The
+concrete lesson: monitoring needs its own security-group rule, tier by tier,
+exactly like the application traffic does** — it is not exempt just because
+it's "just metrics."
+
+```bash
+scripts/deploy-monitoring-vpc.sh
+```
+
+Installs node_exporter + nginx-exporter on the **frontend**; Prometheus,
+Alertmanager, Loki, Promtail, Grafana, and `postgres_exporter` (pointed at
+the RDS endpoint, also with `sslmode=require`) on the **backend** — same
+service set as Part 3/4, just split across the two machines that actually
+exist now. Verified: all seven targets, including the two cross-instance
+ones, `UP`:
+
+```console
+backend      http://localhost:9200/metrics  up
+backend      http://localhost:9201/metrics  up
+nginx        http://10.0.10.249:9113/metrics  up
+node-backend http://localhost:9100/metrics  up
+node-frontend http://10.0.10.249:9100/metrics  up
+postgres     http://localhost:9187/metrics  up
+prometheus   http://localhost:9090/metrics  up
+```
+
+`pg_up` confirms `postgres_exporter` (running on the backend) is genuinely
+reaching the RDS endpoint over the network: `pg_up{job="postgres"} 1`.
+
+**Reaching the UIs**: the backend is *always* private now, so Prometheus,
+Alertmanager, and Grafana are **never given a security-group rule at all** —
+the right answer once you have a real private network, versus Part 3/4's
+"open Grafana to the world" (which was only ever reasonable for a single
+throwaway lab VM). Reach them with SSM port-forwarding instead — a tunnel
+from your laptop to the instance's port, with nothing exposed to the
+network:
+
+```bash
+aws ssm start-session --target i-04443cc6fdea9946e \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["3001"],"localPortNumber":["3001"]}'
+# then open http://localhost:3001 in your own browser
+```
+
+(Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+installed locally — a one-time setup, separate from the AWS CLI itself.)
+
+---
+
+## 49. Verify End-to-End + Cleanup (Part 5)
+
+**What you'll learn:** proving the whole request path, tier by tier, then
+tearing it down.
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" http://52.221.247.255/                 # 200 — frontend, public
+$ curl -s http://52.221.247.255/healthz                                          # ok  — frontend, local
+$ curl -s http://52.221.247.255/api/v1/forecast?...                              # 200 — frontend -> backend (private) -> Open-Meteo
+$ curl -s http://52.221.247.255/api/v1/history                                   # 200 — frontend -> backend -> RDS (private) -> back
+```
+
+Every hop only accepted traffic from the hop before it — the browser never
+touched the backend or RDS directly, by network topology, not convention.
+
+**If you're stopping here** (not continuing to Part 6 in the same sitting):
+
+```bash
+infra/teardown-vpc.sh
+```
+
+Reverses everything in dependency order — RDS, NAT Gateway + its Elastic IP,
+both instances, the security groups, the subnets/route tables/IGW, the VPC
+itself. Re-verify:
+
+```bash
+P="--profile ostad --region ap-southeast-1"
+aws ec2 describe-vpcs $P --filters Name=tag:Name,Values=three-tier-vpc --query 'Vpcs[]'   # []
+aws rds describe-db-instances $P --db-instance-identifier three-tier-vpc-db 2>&1 | grep -o DBInstanceNotFound
+aws ec2 describe-nat-gateways $P --filter Name=tag:Name,Values=three-tier-vpc-nat --query 'NatGateways[?State!=`deleted`]'  # []
+```
+
+**If you're continuing straight to Part 6**, leave everything running — §50
+picks up exactly where this section ends.
+
+---
+
+## 50. Moving the Frontend to a Private Subnet
+
+**What you'll learn:** proving §41's claim for real — nothing about the
+frontend itself changes, only where it lives.
+
+```bash
+infra/44-ec2-instances.sh --frontend-subnet private
+```
+
+```console
+$ infra/44-ec2-instances.sh --frontend-subnet private
+Frontend subnet changed (public -> private) — terminating old instance i-01d2e1727edaf47e2
+Frontend instance: i-07fb514ae677d3a9a (private subnet, t3.micro)
+...
+  Frontend : i-07fb514ae677d3a9a   private IP 10.0.10.249   public IP: None
+```
+
+The old public-subnet frontend is gone; the new one has **no public IP at
+all**. Redeploy the exact same app onto it — same script as §45, zero
+changes:
+
+```bash
+scripts/deploy-frontend-vpc.sh
+```
+
+```console
+GET /            -> 200
+GET /healthz     -> 200
+GET /api/v1/history -> 200
+```
+
+...but only reachable from *inside* the VPC right now. There is currently no
+way to reach this app from the internet at all — that's §51-52's job.
+
+---
+
+## 51. Introduction to AWS Load Balancers
+
+**What you'll learn:** why you need one at all, once nothing has a public IP.
+
+With the frontend private, something has to be the internet-facing door — a
+**Load Balancer**. AWS offers a few kinds:
+
+| | Layer | Use for |
+|---|---|---|
+| **Application Load Balancer (ALB)** | HTTP/HTTPS (L7) | web apps — routes on path/host, does health checks against your app | 
+| **Network Load Balancer (NLB)** | TCP/UDP (L4) | extreme throughput, static IPs, non-HTTP protocols |
+| Classic Load Balancer | both, poorly | legacy — AWS recommends ALB/NLB for anything new |
+
+This app is plain HTTP, so an **ALB** is the right tool: it terminates the
+internet-facing connection, health-checks the frontend, and forwards good
+requests on.
+
+---
+
+## 52. Application Load Balancer Setup
+
+**What you'll learn:** standing up the ALB itself.
+
+```bash
+./infra/45-alb.sh
+```
+
+```console
+$ ./infra/45-alb.sh
+Target group     : arn:...targetgroup/three-tier-vpc-frontend-tg/05fbcf53439a469d (created)
+Registered target: i-07fb514ae677d3a9a
+ALB              : arn:...loadbalancer/app/three-tier-vpc-alb/76b59a4e91a39ae5 (created)
+waiting for ALB to become active........ -> active
+Listener         : :80 -> three-tier-vpc-frontend-tg (created)
+
+  DONE.
+  ALB DNS name: http://three-tier-vpc-alb-405039071.ap-southeast-1.elb.amazonaws.com/
+```
+
+The ALB spans **both** public subnets (`public-a` and `public-b`) — this is
+the concrete reason §40 built 2 AZs from the start; an ALB refuses to launch
+in only one.
+
+---
+
+## 53. Target Groups Configuration
+
+**What you'll learn:** how the ALB decides whether an instance is allowed to
+receive traffic.
+
+A **target group** is the list of instances (or IPs, or Lambda functions) an
+ALB forwards to, plus the health check that decides which of them are
+currently eligible. `infra/45-alb.sh` created one checking `/healthz` every
+15 seconds:
+
+```console
+$ aws elbv2 describe-target-health --target-group-arn arn:...frontend-tg...
+healthy
+```
+
+**Why `/healthz` and not, say, `/api/v1/history`**: the ALB's health check
+must reflect *this instance's* readiness to serve traffic, not the health of
+something two hops away. `/healthz` answers directly from Nginx with no
+backend/database dependency (§13's original reasoning) — so a backend or RDS
+outage doesn't *also* make the ALB pull a perfectly-fine frontend out of
+rotation. That's a deliberately different, narrower signal than Prometheus's
+`up` (§37), which *would* reasonably fire for a backend-only outage — two
+tools, two failure domains, on purpose.
+
+---
+
+## 54. Deploy the Frontend in the Private Subnet
+
+Already done in §50 — this section is here because the class topic list
+calls it out on its own; by this point in the README it's a "re-run
+`scripts/deploy-frontend-vpc.sh` any time you change the frontend" statement,
+not a new step. Confirm the target group still sees it healthy after a
+redeploy:
+
+```console
+$ aws elbv2 describe-target-health --target-group-arn arn:...frontend-tg... --query 'TargetHealthDescriptions[0].TargetHealth.State'
+healthy
+```
+
+---
+
+## 55. Expose the Application Through the ALB
+
+**What you'll learn:** the moment the whole design pays off — a DNS name
+that's the only way in.
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" http://three-tier-vpc-alb-405039071.ap-southeast-1.elb.amazonaws.com/
+200
+```
+
+Open that URL in a browser: the same Weather Board, the same recent-searches
+panel backed by RDS — with the frontend now **entirely unreachable** by any
+other path.
+
+---
+
+## 56. Testing End-to-End Connectivity
+
+**What you'll learn:** proving the full request path, and confirming what's
+*not* reachable is at least as important as what is.
+
+```console
+$ ALB=three-tier-vpc-alb-405039071.ap-southeast-1.elb.amazonaws.com
+$ curl -s -o /dev/null -w "%{http_code}\n" "http://$ALB/"                 # 200
+$ curl -s "http://$ALB/healthz"                                          # ok
+$ curl -s "http://$ALB/api/v1/forecast?latitude=51.5&longitude=-0.13&city=London&current=temperature_2m&timezone=auto"
+{"latitude":51.49,...,"current":{"temperature_2m":21.3,...}}
+$ curl -s "http://$ALB/api/v1/history"
+{"rows":[{"city":"London",...},{"city":"Dhaka",...}]}
+```
+
+Every hop again: ALB (public-a/b) → Nginx (private-app-a, no public IP) →
+Node (private-app-a) → RDS (private-db-a/b). Confirm the negative as well —
+the frontend instance genuinely has no public IP to try:
+
+```console
+$ aws ec2 describe-instances --instance-ids i-07fb514ae677d3a9a --query 'Reservations[0].Instances[0].PublicIpAddress'
+None
+```
+
+**The alerting demo from §37, replayed on this topology**: `pm2 stop
+backend` (via SSM, of course) makes the ALB itself return `502` —
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" "http://$ALB/api/v1/history"
+502
+```
+
+— and within 30 seconds, `BackendDown`/`InstanceDown` reach `firing` in
+Prometheus and Alertmanager, exactly as in Part 4, on this new topology:
+
+```console
+4 alert(s)
+ - InstanceDown firing
+ - InstanceDown firing
+ - BackendDown firing
+ - BackendDown firing
+```
+
+`pm2 start backend` (or `pm2 startOrReload ecosystem.config.cjs`) resolves
+it — the ALB returns `200` again, and both alert count and target health go
+back to zero/`up`.
+
+---
+
+## 57. Network Security Best Practices
+
+**What you'll learn:** the recap, as a checklist you can hold the whole
+architecture in your head against.
+
+- **Exactly one thing is internet-facing**: the ALB. Everything else —
+  frontend, backend, database — has no public IP and no security-group rule
+  that admits the open internet.
+- **Least-privilege, chained, tier by tier**: each security group only
+  admits the *specific* group one hop upstream, on the *specific* port that
+  tier needs — never "admit everything from the VPC," never a wildcard CIDR
+  except at the one true edge (the ALB's `0.0.0.0/0:80`).
+- **A managed database is never in a public subnet "just for testing."**
+  There's no version of "temporarily open RDS to the internet to debug
+  something" that's actually temporary in practice — a private subnet plus
+  SSM access to a box that CAN reach it (§46/§47) is the only path used
+  anywhere in this repo, on purpose.
+- **No inbound rule was ever needed for SSH.** Every single command in Parts
+  5-6 went through SSM, which requires no inbound port at all — the smallest
+  possible attack surface for "being able to run commands on a server."
+- **Security group changes don't retroactively break existing connections**
+  (§44) — when testing that a rule change worked, force a new connection;
+  don't trust a stale one still answering.
+- **A health check should reflect its own layer's readiness** (§53) — the
+  ALB's `/healthz` and Prometheus's `up` are deliberately different signals
+  for deliberately different failure domains.
+
+---
+
+## 58. Full Picture (Parts 5-6) + Cleanup
+
+```mermaid
+flowchart TD
+    subgraph vpc["VPC 10.0.0.0/16 — ap-southeast-1"]
+        subgraph pubsubs["public-a / public-b"]
+            alb["ALB<br/>(Part 6 only)"]
+        end
+        subgraph appsubs["private-app-a"]
+            fe["Frontend EC2<br/>Nginx + exporters"]
+            be["Backend EC2, t3.medium<br/>Node/PM2 + full monitoring stack"]
+        end
+        subgraph dbsubs["private-db-a / private-db-b"]
+            rds[("RDS PostgreSQL<br/>not publicly accessible")]
+        end
+        nat["NAT Gateway<br/>(in public-a)"]
+        igw["Internet Gateway"]
+    end
+    world(("🌐")) -->|":80, Part 6"| alb --> fe
+    world -.->|":80, Part 5 only<br/>(frontend has a public IP)"| fe
+    fe -->|":3000"| be
+    be -->|":5432, SSL"| rds
+    be -->|"Prometheus scrapes<br/>:9100/:9113"| fe
+    fe -.->|"outbound only"| nat
+    be -.->|"outbound only"| nat
+    nat --> igw --> world
+    you["You"] -->|"SSM (no inbound port at all)"| fe & be
+```
+
+| Component | Class 5 | Class 6 |
+|---|---|---|
+| Frontend | `public-a`, public IP | `private-app-a`, no public IP |
+| Public entry point | frontend's own IP | ALB only |
+| Backend | `private-app-a`, no public IP (both classes) | same |
+| Database | RDS, `private-db-*`, no public access (both classes) | same |
+| Monitoring | on the backend, both classes; UIs via SSM port-forward only | same |
+| Reach anything privately | SSM (no bastion, no SSH, either class) | same |
+
+**Cleanup** — one command undoes both classes, since Class 6 only *added* to
+the Class 5 VPC rather than replacing it:
+
+```bash
+infra/teardown-vpc.sh
+```
+
+```console
+Load balancer…
+  - ALB
+  - target group
+RDS…
+  - RDS instance three-tier-vpc-db (deleting — takes a few minutes)
+  - DB subnet group
+Instances…
+  - instance i-07fb514ae677d3a9a
+  - instance i-04443cc6fdea9946e
+NAT Gateway + Elastic IP…
+  - NAT gateway nat-024c2edfd085cceb6 (deleting)
+  - Elastic IP eipalloc-0480e4ad32a2698bc
+Deploy bucket…
+  - s3://three-tier-vpc-deploy-738928894806
+IAM…
+  - instance profile
+  - role three-tier-vpc-ssm-role
+Security groups…
+  - SG sg-03e4782f95bdd38cb
+  - SG sg-0753f70cb8a3423ef
+  - SG sg-0c5c60afde8705d6d
+  - SG sg-0044021458d213386
+Route tables, subnets, IGW, VPC…
+  - route table rtb-03e2a5ee...
+  - route table rtb-095f191c...
+  - subnet subnet-0a6be9... (PUBLIC_A)
+  - subnet subnet-014df0... (PUBLIC_B)
+  - subnet subnet-00758e... (PRIVATE_APP_A)
+  - subnet subnet-01ecef... (PRIVATE_APP_B)
+  - subnet subnet-07ba42... (PRIVATE_DB_A)
+  - subnet subnet-07fe06... (PRIVATE_DB_B)
+  - internet gateway igw-07346871e39853ce1
+  - VPC vpc-07cff05d9fa4bb365
+  - key pair three-tier-vpc-key
+Done. infra/.lab-state-vpc removed.
+```
+
+Re-verify everything is actually gone:
+
+```bash
+P="--profile ostad --region ap-southeast-1"
+aws ec2 describe-vpcs $P --filters Name=tag:Name,Values=three-tier-vpc --query 'Vpcs[]'          # []
+aws ec2 describe-instances $P --filters Name=tag:Name,Values=three-tier-vpc-* \
+  Name=instance-state-name,Values=running,pending --query 'Reservations[]'                       # []
+aws rds describe-db-instances $P --db-instance-identifier three-tier-vpc-db 2>&1 | grep -o DBInstanceNotFound
+aws ec2 describe-nat-gateways $P --filter Name=tag:Name,Values=three-tier-vpc-nat \
+  --query 'NatGateways[?State!=`deleted`]'                                                       # []
+aws elbv2 describe-load-balancers $P --names three-tier-vpc-alb 2>&1 | grep -o LoadBalancerNotFound
+```
+
+If the security-group or VPC deletion step complains, wait a minute (some
+AWS resources take a moment to fully detach) and re-run `infra/teardown-vpc.sh` —
+it's idempotent, same as every teardown script in this repo.
+
+**A real gotcha, found live**: the four security groups reference **each
+other** (frontend-sg allows from backend-sg for monitoring, backend-sg
+allows from frontend-sg for the API, ALB-sg feeds frontend-sg) — a genuine
+cycle. AWS refuses to delete a group that's still named as a source in
+another group's rule, so naively deleting them one at a time in any fixed
+order can deadlock (each is waiting on one that's waiting on it).
+`infra/teardown-vpc.sh` revokes every rule on all four groups **first** —
+which breaks the cycle by construction, since an empty group can't reference
+anything — then deletes the now-empty groups. If you ever write your own
+teardown for a chain of security groups, "revoke everything, then delete
+everything" avoids this entirely.
+
+---
+
 ## Where this goes next
 
 - **Docker:** package each tier (and the monitoring stack) as containers;
   deploy with `docker compose` instead of PM2 + apt-installed binaries.
-- **A real domain + HTTPS:** certbot in front of Nginx, same pattern as many
-  reference deployments — deliberately left out here to keep the AWS surface
-  small for a frontend-focused class.
-- **Split the tiers (and monitoring) across instances:** once "why one VM"
-  (§12) makes sense, try separating them as a follow-on exercise — including
-  putting Prometheus/Grafana on their own box, the more common real-world
-  shape (monitoring shouldn't share fate with what it monitors).
+- **A real domain + HTTPS:** an ACM certificate on the ALB (Part 6 already
+  has the right place to put it) instead of plain HTTP.
+- **Multi-instance HA per tier:** Part 6's subnets already span 2 AZs; adding
+  a second frontend/backend instance and letting the ALB/target group balance
+  across both is the natural next exercise — this repo deliberately stopped
+  at one instance per tier to keep the *networking* lesson from being
+  buried under a *scaling* lesson.
+- **RDS Multi-AZ**: flip on a standby replica for automatic failover — a
+  cost/complexity trade-off worth understanding once single-AZ RDS makes sense.
+- **VPC endpoints** for S3/SSM: reduce what actually needs to cross the NAT
+  Gateway (and its per-GB cost) — a real cost-optimization technique this
+  module didn't need to reach for.
 - **Grafana Alloy:** Promtail (§36) is in maintenance mode; Grafana's
   actively-developed replacement is worth a look once Promtail's model makes
   sense.
