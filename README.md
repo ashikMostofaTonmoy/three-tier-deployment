@@ -1,5 +1,6 @@
-# Frontend Development & AWS Deployment
+# Three-Tier Application: AWS Deployment & CI/CD Automation
 
+<!--
 > A hands-on lab for the **DevOps Master** course.
 > **Part 1** deploys just the frontend, by hand, with a script, and with GitHub
 > Actions. **Part 2** turns it into a **real three-tier app** (frontend + backend +
@@ -8,6 +9,7 @@
 
 The repo is laid out as a "three-tier" project from the start — `frontend/` (Part 1),
 `backend/` + `database/` (Part 2) — so nothing moves as the lab grows.
+-->
 
 ---
 
