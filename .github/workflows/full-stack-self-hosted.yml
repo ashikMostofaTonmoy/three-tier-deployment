@@ -23,13 +23,13 @@ on:
   # has its own concurrency group below, but they'd still both run and could
   # interleave writes) — if you want push-to-deploy, enable it on ONLY ONE of
   # the two workflows, or point each at a different instance.
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'frontend/**'
-  #     - 'backend/**'
-  #     - 'database/migrations/**'
-  #     - '.github/workflows/full-stack-self-hosted.yml'
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "database/migrations/**"
+      - ".github/workflows/full-stack-self-hosted.yml"
 
 concurrency:
   group: full-stack-deploy-self-hosted-${{ github.ref }}
@@ -43,7 +43,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
       - name: Build the frontend (locally — no upload needed, same machine)
         working-directory: frontend
